@@ -35,7 +35,15 @@ pub const HEADER_SIZE: u64 = 4096;
 /// Tamanho de chunk padrão (1 MiB). Arquivos são fatiados nesse tamanho.
 pub const DEFAULT_CHUNK: u32 = 1 << 20;
 /// Versão do formato on-disk.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
+/// Nível de compressão zstd padrão (1..=22; 3 é o equilíbrio do zstd).
+pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
+
+/// Método de codificação de um bloco, gravado como 1º byte do bloco no disco.
+mod method {
+    pub const RAW: u8 = 0;
+    pub const ZSTD: u8 = 1;
+}
 
 /// Endereço de conteúdo: BLAKE3 de 32 bytes.
 pub type Hash = [u8; 32];
@@ -43,8 +51,12 @@ pub type Hash = [u8; 32];
 /// Onde um bloco vive fisicamente dentro do arquivo container.
 #[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct BlockRef {
+    /// Posição no arquivo do byte de método (início do bloco gravado).
     pub offset: u64,
+    /// Bytes ocupados no disco (inclui o byte de método).
     pub len: u32,
+    /// Tamanho do conteúdo original (descomprimido) deste chunk.
+    pub raw_len: u32,
 }
 
 /// Metadados de um arquivo lógico guardado no container.
@@ -76,6 +88,8 @@ pub struct Vault {
     catalog: Catalog,
     /// Próxima posição livre para append na região de dados.
     next_append: u64,
+    /// Nível de compressão zstd usado ao gravar blocos novos.
+    zstd_level: i32,
 }
 
 impl Vault {
@@ -98,6 +112,7 @@ impl Vault {
             chunk_size,
             catalog: Catalog::default(),
             next_append: HEADER_SIZE,
+            zstd_level: DEFAULT_ZSTD_LEVEL,
         };
         // Reserva o header e grava catálogo vazio + ponteiro.
         vault.file.set_len(HEADER_SIZE)?;
@@ -143,6 +158,7 @@ impl Vault {
             catalog,
             // Append começa após o catálogo atual — preserva gerações antigas.
             next_append: catalog_offset + catalog_len,
+            zstd_level: DEFAULT_ZSTD_LEVEL,
         })
     }
 
@@ -151,6 +167,10 @@ impl Vault {
     }
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+    /// Ajusta o nível de compressão zstd para gravações subsequentes.
+    pub fn set_zstd_level(&mut self, level: i32) {
+        self.zstd_level = level;
     }
 
     /// Adiciona/atualiza um arquivo do disco real no caminho lógico `dest`.
@@ -198,9 +218,8 @@ impl Vault {
         if self.catalog.blocks.contains_key(&hash) {
             return Ok(hash); // dedup: já existe, não regrava.
         }
-        // TODO(pipeline): comprimir (zstd) e criptografar (XChaCha20) aqui,
-        // gravando o resultado e guardando o tamanho real no BlockRef.
-        let stored = block_pipeline(data);
+        // Pipeline: comprime (e, futuramente, criptografa). 1º byte = método.
+        let stored = block_pipeline(data, self.zstd_level)?;
         let offset = self.next_append;
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(&stored)?;
@@ -210,6 +229,7 @@ impl Vault {
             BlockRef {
                 offset,
                 len: stored.len() as u32,
+                raw_len: data.len() as u32,
             },
         );
         Ok(hash)
@@ -235,8 +255,7 @@ impl Vault {
             let mut buf = vec![0u8; bref.len as usize];
             self.file.seek(SeekFrom::Start(bref.offset))?;
             self.file.read_exact(&mut buf)?;
-            // TODO(pipeline): descriptografar + descomprimir aqui.
-            let data = unblock_pipeline(&buf);
+            let data = unblock_pipeline(&buf)?;
             // Valida integridade pelo endereço de conteúdo.
             if blake3::hash(&data).as_bytes() != hash {
                 bail!("falha de integridade em bloco de {logical}");
@@ -272,14 +291,16 @@ impl Vault {
         Ok(())
     }
 
-    /// Estatísticas de uso e ganho de deduplicação.
+    /// Estatísticas de uso, separando ganho de dedup e de compressão.
     pub fn stats(&self) -> Stats {
         let logical: u64 = self.catalog.files.values().map(|f| f.size).sum();
+        let unique_raw: u64 = self.catalog.blocks.values().map(|b| b.raw_len as u64).sum();
         let physical: u64 = self.catalog.blocks.values().map(|b| b.len as u64).sum();
         Stats {
             files: self.catalog.files.len(),
             unique_blocks: self.catalog.blocks.len(),
             logical_bytes: logical,
+            unique_raw_bytes: unique_raw,
             physical_bytes: physical,
         }
     }
@@ -289,29 +310,67 @@ impl Vault {
 pub struct Stats {
     pub files: usize,
     pub unique_blocks: usize,
+    /// Soma do tamanho lógico de todos os arquivos.
     pub logical_bytes: u64,
+    /// Soma do tamanho original dos blocos *únicos* (após dedup, antes de comprimir).
+    pub unique_raw_bytes: u64,
+    /// Bytes realmente ocupados no disco (após dedup e compressão).
     pub physical_bytes: u64,
 }
 
+fn savings(part: u64, whole: u64) -> f64 {
+    if whole == 0 {
+        return 0.0;
+    }
+    1.0 - (part as f64 / whole as f64)
+}
+
 impl Stats {
-    /// Quanto foi economizado por dedup (0.0 = nada, 0.5 = metade).
+    /// Economia só por deduplicação (blocos repetidos eliminados).
     pub fn dedup_savings(&self) -> f64 {
-        if self.logical_bytes == 0 {
-            return 0.0;
-        }
-        1.0 - (self.physical_bytes as f64 / self.logical_bytes as f64)
+        savings(self.unique_raw_bytes, self.logical_bytes)
+    }
+    /// Economia só por compressão (sobre os blocos únicos).
+    pub fn compression_savings(&self) -> f64 {
+        savings(self.physical_bytes, self.unique_raw_bytes)
+    }
+    /// Economia total: do tamanho lógico ao tamanho em disco.
+    pub fn total_savings(&self) -> f64 {
+        savings(self.physical_bytes, self.logical_bytes)
     }
 }
 
-/// Estágio de gravação de bloco. v0: identidade.
-/// TODO(pipeline): zstd::compress -> XChaCha20Poly1305::encrypt.
-fn block_pipeline(data: &[u8]) -> Vec<u8> {
-    data.to_vec()
+/// Estágio de gravação de bloco: comprime com zstd e prefixa o byte de método.
+/// Se a compressão não reduzir o tamanho (ex.: jpg/zip já comprimidos), grava
+/// cru — assim nunca pioramos o tamanho por bloco.
+/// TODO(pipeline): após comprimir, criptografar (XChaCha20-Poly1305).
+fn block_pipeline(data: &[u8], level: i32) -> Result<Vec<u8>> {
+    let compressed = zstd::stream::encode_all(data, level).context("comprimindo bloco")?;
+    if compressed.len() < data.len() {
+        let mut out = Vec::with_capacity(compressed.len() + 1);
+        out.push(method::ZSTD);
+        out.extend_from_slice(&compressed);
+        Ok(out)
+    } else {
+        let mut out = Vec::with_capacity(data.len() + 1);
+        out.push(method::RAW);
+        out.extend_from_slice(data);
+        Ok(out)
+    }
 }
 
-/// Inverso de [`block_pipeline`]. v0: identidade.
-fn unblock_pipeline(data: &[u8]) -> Vec<u8> {
-    data.to_vec()
+/// Inverso de [`block_pipeline`]: lê o byte de método e decodifica.
+fn unblock_pipeline(stored: &[u8]) -> Result<Vec<u8>> {
+    let (m, payload) = stored
+        .split_first()
+        .context("bloco vazio (container corrompido)")?;
+    match *m {
+        method::RAW => Ok(payload.to_vec()),
+        method::ZSTD => {
+            zstd::stream::decode_all(payload).context("descomprimindo bloco")
+        }
+        other => bail!("método de bloco desconhecido: {other}"),
+    }
 }
 
 /// Lê até encher `buf` (ou EOF). Retorna bytes lidos.
@@ -368,5 +427,29 @@ mod tests {
         assert_eq!(out.into_inner(), b"conteudo identico repetido");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pipeline_compresses_and_falls_back_to_raw() {
+        // Dados compressíveis: pipeline deve marcar ZSTD e reduzir o tamanho.
+        let compressible = vec![b'A'; 4096];
+        let stored = block_pipeline(&compressible, DEFAULT_ZSTD_LEVEL).unwrap();
+        assert_eq!(stored[0], method::ZSTD);
+        assert!(stored.len() < compressible.len());
+        assert_eq!(unblock_pipeline(&stored).unwrap(), compressible);
+
+        // Dados incompressíveis (pseudo-aleatórios): deve cair pra RAW e não inchar.
+        let mut incompressible = Vec::with_capacity(4096);
+        let mut x: u32 = 0x1234_5678;
+        for _ in 0..4096 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            incompressible.push((x & 0xff) as u8);
+        }
+        let stored = block_pipeline(&incompressible, DEFAULT_ZSTD_LEVEL).unwrap();
+        assert_eq!(stored[0], method::RAW);
+        assert_eq!(stored.len(), incompressible.len() + 1);
+        assert_eq!(unblock_pipeline(&stored).unwrap(), incompressible);
     }
 }

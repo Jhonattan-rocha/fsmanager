@@ -41,16 +41,18 @@ Durabilidade: grava catálogo → fsync → atualiza ponteiro no header → fsyn
 Cair antes do header mantém o catálogo anterior válido. Cada catálogo gravado é
 uma geração — semente do versionamento.
 
-## Estado atual (v0)
+## Estado atual
 - [x] Workspace Rust: `fsm-core` (motor) + `fsm-cli` (binário `fsm`).
 - [x] Container: init, add, ls, cat, extract, stats.
 - [x] Dedup por conteúdo + validação de integridade na leitura.
-- [ ] Pipeline real: `block_pipeline`/`unblock_pipeline` são identidade (ganchos prontos).
+- [x] Compressão zstd no pipeline (byte de método por bloco; fallback p/ cru quando
+      não compensa). `stats` separa dedup × compressão × total. Formato v2.
+- [ ] Pipeline de criptografia: gancho `TODO(pipeline)` após a compressão.
 
 ## Roadmap
 1. **v0** motor + CLI com dedup. ✅
-2. Diretórios reais + remoção + journaling explícito (hoje o catálogo cresce append-only).
-3. Pipeline: compressão zstd por bloco.
+2. Pipeline: compressão zstd por bloco. ✅
+3. Diretórios reais + remoção + journaling explícito (hoje o catálogo cresce append-only).
 4. Pipeline: criptografia XChaCha20-Poly1305 + KDF Argon2 (senha → chave-mestra).
 5. Snapshots: comando para nomear/listar/restaurar gerações; GC de blocos órfãos.
 6. Chunking por conteúdo (CDC/FastCDC) para melhor dedup em arquivos editados.

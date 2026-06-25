@@ -32,6 +32,9 @@ enum Cmd {
         /// Caminho lógico dentro do container (padrão: nome do arquivo)
         #[arg(long = "as")]
         dest: Option<String>,
+        /// Nível de compressão zstd (1..=22). Padrão: 3.
+        #[arg(long)]
+        level: Option<i32>,
     },
     /// Lista os arquivos guardados.
     Ls { vault: PathBuf },
@@ -54,13 +57,21 @@ fn main() -> Result<()> {
             Vault::create(&vault, chunk.unwrap_or(DEFAULT_CHUNK))?;
             println!("container criado: {}", vault.display());
         }
-        Cmd::Add { vault, src, dest } => {
+        Cmd::Add {
+            vault,
+            src,
+            dest,
+            level,
+        } => {
             let dest = dest.unwrap_or_else(|| {
                 src.file_name()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "arquivo".into())
             });
             let mut v = Vault::open(&vault)?;
+            if let Some(l) = level {
+                v.set_zstd_level(l);
+            }
             v.add_file(&src, &dest)?;
             v.commit()?;
             println!("adicionado: {} -> {}", src.display(), dest);
@@ -87,11 +98,14 @@ fn main() -> Result<()> {
         Cmd::Stats { vault } => {
             let v = Vault::open(&vault)?;
             let s = v.stats();
-            println!("arquivos:        {}", s.files);
-            println!("blocos únicos:   {}", s.unique_blocks);
-            println!("tamanho lógico:  {} bytes", s.logical_bytes);
-            println!("tamanho físico:  {} bytes", s.physical_bytes);
-            println!("economia dedup:  {:.1}%", s.dedup_savings() * 100.0);
+            println!("arquivos:           {}", s.files);
+            println!("blocos únicos:      {}", s.unique_blocks);
+            println!("tamanho lógico:     {} bytes", s.logical_bytes);
+            println!("após dedup:         {} bytes", s.unique_raw_bytes);
+            println!("em disco (físico):  {} bytes", s.physical_bytes);
+            println!("economia dedup:     {:.1}%", s.dedup_savings() * 100.0);
+            println!("economia compressão:{:.1}%", s.compression_savings() * 100.0);
+            println!("economia total:     {:.1}%", s.total_savings() * 100.0);
         }
     }
     Ok(())
