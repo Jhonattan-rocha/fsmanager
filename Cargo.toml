@@ -1,0 +1,16 @@
+[workspace]
+members = ["crates/fsm-core", "crates/fsm-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["RiseTec"]
+
+[workspace.dependencies]
+anyhow = "1"
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+clap = { version = "4", features = ["derive"] }

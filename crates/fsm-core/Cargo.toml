@@ -1,0 +1,13 @@
+[package]
+name = "fsm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Motor do container virtual: object store endereçado por conteúdo, com dedup."
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+serde.workspace = true
+bincode.workspace = true

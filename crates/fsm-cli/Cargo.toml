@@ -1,0 +1,16 @@
+[package]
+name = "fsm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CLI do fsmanager: criar e gerenciar containers virtuais."
+
+[[bin]]
+name = "fsm"
+path = "src/main.rs"
+
+[dependencies]
+fsm-core = { path = "../fsm-core" }
+anyhow.workspace = true
+clap.workspace = true
