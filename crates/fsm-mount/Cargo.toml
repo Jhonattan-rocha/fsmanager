@@ -1,0 +1,34 @@
+[package]
+name = "fsm-mount"
+version = "0.0.1"
+edition = "2021"
+# GPL-3.0 porque o binário linka a winfsp-rs (GPLv3) no Windows.
+# fsm-core / fsm-cli / UI permanecem MIT OR Apache-2.0 (binário separado).
+license = "GPL-3.0"
+description = "Monta o container fsmanager como drive (WinFsp no Windows, FUSE no Linux)."
+
+[lib]
+name = "fsm_mount"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fsm-mount"
+path = "src/main.rs"
+
+[dependencies]
+fsm-core = { path = "../fsm-core" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+
+[target.'cfg(windows)'.dependencies]
+winfsp = { version = "0.13", features = ["system"] }
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Memory",
+] }
+
+[target.'cfg(windows)'.build-dependencies]
+winfsp = { version = "0.13", features = ["delayload"] }

@@ -363,6 +363,110 @@ impl Vault {
         Ok(written)
     }
 
+    /// Lê `len` bytes de um arquivo lógico a partir de `offset`, decodificando
+    /// apenas os chunks que tocam o intervalo. Base para o mount (leitura aleatória).
+    pub fn read_range(&mut self, logical: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let logical = normalize_path(logical);
+        let entry = self
+            .catalog
+            .files
+            .get(&logical)
+            .with_context(|| format!("arquivo não encontrado: {logical}"))?
+            .clone();
+        if offset >= entry.size || len == 0 {
+            return Ok(Vec::new());
+        }
+        let end = (offset + len as u64).min(entry.size);
+        let mut out = Vec::with_capacity((end - offset) as usize);
+
+        let mut pos: u64 = 0; // início do chunk corrente, em bytes lógicos
+        for hash in &entry.chunks {
+            let bref = *self
+                .catalog
+                .blocks
+                .get(hash)
+                .context("bloco referenciado ausente (container corrompido)")?;
+            let chunk_start = pos;
+            let chunk_end = pos + bref.raw_len as u64;
+            pos = chunk_end;
+            if chunk_end <= offset {
+                continue; // chunk inteiramente antes do intervalo
+            }
+            if chunk_start >= end {
+                break; // chunks seguintes estão além do intervalo
+            }
+            let mut buf = vec![0u8; bref.len as usize];
+            self.file.seek(SeekFrom::Start(bref.offset))?;
+            self.file.read_exact(&mut buf)?;
+            let data = decode_block(&buf, self.key())?;
+            if blake3::hash(&data).as_bytes() != hash {
+                bail!("falha de integridade em bloco de {logical}");
+            }
+            let from = offset.saturating_sub(chunk_start) as usize;
+            let to = ((end - chunk_start) as usize).min(data.len());
+            out.extend_from_slice(&data[from..to]);
+        }
+        Ok(out)
+    }
+
+    /// Resolve um caminho para diretório, arquivo ou inexistente (para `lookup`/`getattr`).
+    pub fn resolve(&self, path: &str) -> Option<NodeKind> {
+        let p = normalize_path(path);
+        if p == "/" {
+            return Some(NodeKind::Dir);
+        }
+        if let Some(e) = self.catalog.files.get(&p) {
+            return Some(NodeKind::File {
+                size: e.size,
+                mtime: e.mtime,
+            });
+        }
+        let pre = format!("{p}/");
+        if self.catalog.files.keys().any(|k| k.starts_with(&pre)) {
+            return Some(NodeKind::Dir);
+        }
+        None
+    }
+
+    /// Lista os filhos imediatos de um diretório (para `readdir`).
+    /// Diretórios são implícitos: derivados dos prefixos dos caminhos.
+    pub fn list_dir(&self, path: &str) -> Vec<DirEntry> {
+        let p = normalize_path(path);
+        let pre = if p == "/" { "/".to_string() } else { format!("{p}/") };
+        let mut subdirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut entries: Vec<DirEntry> = Vec::new();
+        for (k, e) in &self.catalog.files {
+            if !k.starts_with(&pre) {
+                continue;
+            }
+            let rest = &k[pre.len()..];
+            if rest.is_empty() {
+                continue;
+            }
+            match rest.find('/') {
+                None => entries.push(DirEntry {
+                    name: rest.to_string(),
+                    is_dir: false,
+                    size: e.size,
+                    mtime: e.mtime,
+                }),
+                Some(i) => {
+                    subdirs.insert(rest[..i].to_string());
+                }
+            }
+        }
+        for d in subdirs {
+            entries.push(DirEntry {
+                name: d,
+                is_dir: true,
+                size: 0,
+                mtime: 0,
+            });
+        }
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        entries
+    }
+
     /// Remove um arquivo lógico do catálogo. Retorna `true` se existia.
     /// O espaço dos blocos só é recuperado em [`compact_to`].
     pub fn remove(&mut self, logical: &str) -> Result<bool> {
@@ -599,6 +703,20 @@ pub struct Stats {
     pub physical_bytes: u64,
     pub encrypted: bool,
     pub snapshots: usize,
+}
+
+/// O que um caminho representa no sistema de arquivos lógico.
+pub enum NodeKind {
+    Dir,
+    File { size: u64, mtime: i64 },
+}
+
+/// Uma entrada de diretório (filho imediato), para `readdir`.
+pub struct DirEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub mtime: i64,
 }
 
 /// Resultado de uma compactação ([`Vault::compact_to`]).
@@ -878,6 +996,54 @@ mod tests {
                 (x & 0xff) as u8
             })
             .collect()
+    }
+
+    #[test]
+    fn read_range_and_directory_listing() {
+        let dir = tmp_dir("mount");
+        let vault_path = dir.join("m.vault");
+        let _ = std::fs::remove_file(&vault_path);
+
+        // Arquivo grande (multi-chunk) para exercitar leitura aleatória.
+        let big = pseudo_random(77, 300_000);
+        let bigp = dir.join("big.bin");
+        std::fs::write(&bigp, &big).unwrap();
+
+        let note = dir.join("note.txt");
+        std::fs::write(&note, b"oi").unwrap();
+
+        let mut v = Vault::create(&vault_path, DEFAULT_AVG_CHUNK).unwrap();
+        v.add_file(&bigp, "/docs/big.bin").unwrap();
+        v.add_file(&note, "/note.txt").unwrap();
+        v.commit().unwrap();
+
+        // Leitura aleatória no meio do arquivo, cruzando fronteiras de chunk.
+        let off = 130_000u64;
+        let n = 90_000usize;
+        let got = v.read_range("/docs/big.bin", off, n).unwrap();
+        assert_eq!(got, &big[off as usize..off as usize + n]);
+
+        // Leitura além do fim trunca no tamanho real.
+        let tail = v.read_range("/docs/big.bin", 299_990, 1000).unwrap();
+        assert_eq!(tail, &big[299_990..]);
+
+        // resolve: dir, arquivo, inexistente.
+        assert!(matches!(v.resolve("/"), Some(NodeKind::Dir)));
+        assert!(matches!(v.resolve("/docs"), Some(NodeKind::Dir)));
+        assert!(matches!(v.resolve("/docs/big.bin"), Some(NodeKind::File { .. })));
+        assert!(v.resolve("/naoexiste").is_none());
+
+        // list_dir da raiz: um subdir "docs" e o arquivo "note.txt".
+        let root = v.list_dir("/");
+        let names: Vec<_> = root.iter().map(|e| (e.name.as_str(), e.is_dir)).collect();
+        assert_eq!(names, vec![("docs", true), ("note.txt", false)]);
+
+        let docs = v.list_dir("/docs");
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].name, "big.bin");
+        assert!(!docs[0].is_dir);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

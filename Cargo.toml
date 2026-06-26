@@ -1,7 +1,10 @@
 [workspace]
 members = ["crates/fsm-core", "crates/fsm-cli"]
-# A app Tauri é um projeto Cargo próprio (build via npm/tauri) — fora do workspace.
-exclude = ["apps/fsm-desktop/src-tauri"]
+# Projetos Cargo próprios, fora do workspace:
+#  - app Tauri (build via npm/tauri)
+#  - fsm-mount: depende de winfsp (GPLv3) e exige libclang só no Windows; mantê-lo
+#    fora evita acoplar `cargo test` do core ao libclang.
+exclude = ["apps/fsm-desktop/src-tauri", "crates/fsm-mount"]
 resolver = "2"
 
 [workspace.package]
