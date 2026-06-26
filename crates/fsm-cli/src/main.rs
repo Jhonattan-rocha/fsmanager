@@ -42,8 +42,34 @@ enum Cmd {
         #[arg(long, short = 'p')]
         password: Option<String>,
     },
-    /// Lista os arquivos guardados.
+    /// Lista os arquivos guardados (opcionalmente sob um prefixo).
     Ls {
+        vault: PathBuf,
+        /// Prefixo/diretório para filtrar (ex: /docs)
+        prefix: Option<String>,
+        #[arg(long, short = 'p')]
+        password: Option<String>,
+    },
+    /// Remove um arquivo (ou um diretório inteiro com -r).
+    Rm {
+        vault: PathBuf,
+        path: String,
+        /// Remove recursivamente um diretório.
+        #[arg(long, short = 'r')]
+        recursive: bool,
+        #[arg(long, short = 'p')]
+        password: Option<String>,
+    },
+    /// Move/renomeia um arquivo ou diretório dentro do container.
+    Mv {
+        vault: PathBuf,
+        src: String,
+        dst: String,
+        #[arg(long, short = 'p')]
+        password: Option<String>,
+    },
+    /// Compacta o container, recuperando espaço de removidos e gerações antigas.
+    Gc {
         vault: PathBuf,
         #[arg(long, short = 'p')]
         password: Option<String>,
@@ -117,12 +143,75 @@ fn main() -> Result<()> {
             v.commit()?;
             println!("adicionado: {} -> {}", src.display(), dest);
         }
-        Cmd::Ls { vault, password } => {
+        Cmd::Ls {
+            vault,
+            prefix,
+            password,
+        } => {
             let pw = resolve_pw(password);
             let v = Vault::open(&vault, pw.as_deref())?;
+            let filter = prefix.map(|p| {
+                let p = p.replace('\\', "/");
+                format!("/{}", p.trim_start_matches('/'))
+            });
             for (path, entry) in &v.catalog().files {
+                if let Some(f) = &filter {
+                    if path != f && !path.starts_with(&format!("{}/", f.trim_end_matches('/'))) {
+                        continue;
+                    }
+                }
                 println!("{:>12}  {}", entry.size, path);
             }
+        }
+        Cmd::Rm {
+            vault,
+            path,
+            recursive,
+            password,
+        } => {
+            let pw = resolve_pw(password);
+            let mut v = Vault::open(&vault, pw.as_deref())?;
+            if recursive {
+                let n = v.remove_dir(&path)?;
+                v.commit()?;
+                println!("removidos {n} arquivo(s) sob {path}");
+            } else if v.remove(&path)? {
+                v.commit()?;
+                println!("removido: {path}");
+            } else {
+                anyhow::bail!("não encontrado: {path} (use -r para remover diretório)");
+            }
+        }
+        Cmd::Mv {
+            vault,
+            src,
+            dst,
+            password,
+        } => {
+            let pw = resolve_pw(password);
+            let mut v = Vault::open(&vault, pw.as_deref())?;
+            v.rename(&src, &dst)?;
+            v.commit()?;
+            println!("movido: {src} -> {dst}");
+        }
+        Cmd::Gc { vault, password } => {
+            let pw = resolve_pw(password);
+            let mut v = Vault::open(&vault, pw.as_deref())?;
+            let tmp = PathBuf::from(format!("{}.compacting", vault.display()));
+            if tmp.exists() {
+                std::fs::remove_file(&tmp)?;
+            }
+            let report = v.compact_to(&tmp)?;
+            drop(v); // fecha o handle do original antes de substituir
+            std::fs::rename(&tmp, &vault)?;
+            println!(
+                "compactado: {} -> {} bytes ({} recuperados); blocos {} -> {}",
+                report.bytes_before,
+                report.bytes_after,
+                report.reclaimed_bytes(),
+                report.blocks_before,
+                report.blocks_after
+            );
         }
         Cmd::Cat {
             vault,

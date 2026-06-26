@@ -28,7 +28,7 @@
 //! Dedup acontece *dentro* do container sob a chave-mestra única — evitando os
 //! ataques de confirmação da *convergent encryption*.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -346,6 +346,139 @@ impl Vault {
         Ok(written)
     }
 
+    /// Remove um arquivo lógico do catálogo. Retorna `true` se existia.
+    /// O espaço dos blocos só é recuperado em [`compact_to`].
+    pub fn remove(&mut self, logical: &str) -> Result<bool> {
+        let logical = normalize_path(logical);
+        Ok(self.catalog.files.remove(&logical).is_some())
+    }
+
+    /// Remove recursivamente tudo sob o diretório `prefix`. Retorna a contagem.
+    pub fn remove_dir(&mut self, prefix: &str) -> Result<usize> {
+        let base = normalize_path(prefix);
+        let pre = format!("{}/", base.trim_end_matches('/'));
+        let victims: Vec<String> = self
+            .catalog
+            .files
+            .keys()
+            .filter(|k| **k == base || k.starts_with(&pre))
+            .cloned()
+            .collect();
+        for k in &victims {
+            self.catalog.files.remove(k);
+        }
+        Ok(victims.len())
+    }
+
+    /// Move/renomeia um arquivo OU uma subárvore inteira (se `src` for um diretório).
+    pub fn rename(&mut self, src: &str, dst: &str) -> Result<()> {
+        let src = normalize_path(src);
+        let dst = normalize_path(dst);
+
+        // Caso 1: arquivo exato.
+        if let Some(entry) = self.catalog.files.remove(&src) {
+            self.catalog.files.insert(dst, entry);
+            return Ok(());
+        }
+
+        // Caso 2: diretório (prefixo).
+        let pre = format!("{}/", src.trim_end_matches('/'));
+        let moves: Vec<String> = self
+            .catalog
+            .files
+            .keys()
+            .filter(|k| k.starts_with(&pre))
+            .cloned()
+            .collect();
+        if moves.is_empty() {
+            bail!("origem não encontrada: {src}");
+        }
+        let dst_base = dst.trim_end_matches('/').to_string();
+        for old in moves {
+            let suffix = &old[pre.len()..];
+            let new = format!("{dst_base}/{suffix}");
+            let entry = self.catalog.files.remove(&old).unwrap();
+            self.catalog.files.insert(new, entry);
+        }
+        Ok(())
+    }
+
+    /// Reescreve o container em `dest` mantendo só os blocos alcançáveis pelos
+    /// arquivos atuais — recupera espaço de removidos e de gerações antigas.
+    /// Preserva a criptografia (mesma chave/salt) para a mesma senha continuar valendo.
+    pub fn compact_to(&mut self, dest: impl AsRef<Path>) -> Result<CompactReport> {
+        let dest = dest.as_ref();
+        if dest.exists() {
+            bail!("destino já existe: {}", dest.display());
+        }
+        let bytes_before = self.file.metadata()?.len();
+        let blocks_before = self.catalog.blocks.len();
+
+        // Conjunto de hashes realmente referenciados pelos arquivos atuais.
+        let mut reachable: HashSet<Hash> = HashSet::new();
+        for f in self.catalog.files.values() {
+            for h in &f.chunks {
+                reachable.insert(*h);
+            }
+        }
+
+        let mut newfile = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dest)
+            .with_context(|| format!("criando {}", dest.display()))?;
+        newfile.set_len(HEADER_SIZE)?;
+        let mut next = HEADER_SIZE;
+        let mut new_blocks: HashMap<Hash, BlockRef> = HashMap::new();
+        let mut buf = Vec::new();
+
+        for (hash, bref) in &self.catalog.blocks {
+            if !reachable.contains(hash) {
+                continue; // bloco órfão: descartado.
+            }
+            buf.resize(bref.len as usize, 0);
+            self.file.seek(SeekFrom::Start(bref.offset))?;
+            self.file.read_exact(&mut buf)?;
+            newfile.seek(SeekFrom::Start(next))?;
+            newfile.write_all(&buf)?;
+            new_blocks.insert(
+                *hash,
+                BlockRef {
+                    offset: next,
+                    len: bref.len,
+                    raw_len: bref.raw_len,
+                },
+            );
+            next += bref.len as u64;
+        }
+
+        let new_catalog = Catalog {
+            blocks: new_blocks,
+            files: self.catalog.files.clone(),
+        };
+        let raw = bincode::serialize(&new_catalog).context("serializando catálogo")?;
+        let bytes = match &self.enc {
+            Some(e) => seal(&e.key, &raw).context("cifrando catálogo")?,
+            None => raw,
+        };
+        newfile.seek(SeekFrom::Start(next))?;
+        newfile.write_all(&bytes)?;
+        newfile.sync_data()?;
+
+        let header = build_header(self.chunk_size, next, bytes.len() as u64, self.enc.as_ref());
+        newfile.seek(SeekFrom::Start(0))?;
+        newfile.write_all(&header)?;
+        newfile.sync_all()?;
+
+        Ok(CompactReport {
+            blocks_before,
+            blocks_after: new_catalog.blocks.len(),
+            bytes_before,
+            bytes_after: next + bytes.len() as u64,
+        })
+    }
+
     /// Persiste o catálogo no fim do arquivo e atualiza o header.
     ///
     /// Ordem de durabilidade: grava catálogo → fsync → atualiza header → fsync.
@@ -361,18 +494,7 @@ impl Vault {
         self.file.write_all(&bytes)?;
         self.file.sync_data()?;
 
-        let mut header = [0u8; HEADER_SIZE as usize];
-        header[0..8].copy_from_slice(MAGIC);
-        header[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-        header[12..16].copy_from_slice(&self.chunk_size.to_le_bytes());
-        header[16..24].copy_from_slice(&offset.to_le_bytes());
-        header[24..32].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
-        if let Some(e) = &self.enc {
-            header[32..36].copy_from_slice(&HFLAG_ENCRYPTED.to_le_bytes());
-            header[36..36 + SALT_LEN].copy_from_slice(&e.salt);
-            header[52..56].copy_from_slice(&(e.verify.len() as u32).to_le_bytes());
-            header[56..56 + e.verify.len()].copy_from_slice(&e.verify);
-        }
+        let header = build_header(self.chunk_size, offset, bytes.len() as u64, self.enc.as_ref());
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(&header)?;
         self.file.sync_all()?;
@@ -408,6 +530,42 @@ pub struct Stats {
     /// Bytes realmente ocupados no disco (após dedup e compressão).
     pub physical_bytes: u64,
     pub encrypted: bool,
+}
+
+/// Resultado de uma compactação ([`Vault::compact_to`]).
+pub struct CompactReport {
+    pub blocks_before: usize,
+    pub blocks_after: usize,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+}
+
+impl CompactReport {
+    pub fn reclaimed_bytes(&self) -> u64 {
+        self.bytes_before.saturating_sub(self.bytes_after)
+    }
+}
+
+/// Monta o header de 4 KiB com os ponteiros e o estado de criptografia.
+fn build_header(
+    chunk_size: u32,
+    catalog_offset: u64,
+    catalog_len: u64,
+    enc: Option<&EncState>,
+) -> [u8; HEADER_SIZE as usize] {
+    let mut header = [0u8; HEADER_SIZE as usize];
+    header[0..8].copy_from_slice(MAGIC);
+    header[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    header[12..16].copy_from_slice(&chunk_size.to_le_bytes());
+    header[16..24].copy_from_slice(&catalog_offset.to_le_bytes());
+    header[24..32].copy_from_slice(&catalog_len.to_le_bytes());
+    if let Some(e) = enc {
+        header[32..36].copy_from_slice(&HFLAG_ENCRYPTED.to_le_bytes());
+        header[36..36 + SALT_LEN].copy_from_slice(&e.salt);
+        header[52..56].copy_from_slice(&(e.verify.len() as u32).to_le_bytes());
+        header[56..56 + e.verify.len()].copy_from_slice(&e.verify);
+    }
+    header
 }
 
 fn savings(part: u64, whole: u64) -> f64 {
@@ -575,6 +733,62 @@ mod tests {
         let mut out = Cursor::new(Vec::new());
         v2.extract("a.bin", &mut out).unwrap();
         assert_eq!(out.into_inner(), b"conteudo identico repetido");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rm_mv_and_gc_reclaim_space() {
+        let dir = tmp_dir("gc");
+        let vault_path = dir.join("g.vault");
+        let compact_path = dir.join("g2.vault");
+        let _ = std::fs::remove_file(&vault_path);
+        let _ = std::fs::remove_file(&compact_path);
+
+        // Conteúdo incompressível e único por arquivo (evita dedup/compressão
+        // mascararem a recuperação de espaço).
+        let mk = |seed: u32, n: usize| -> Vec<u8> {
+            let mut x = seed | 1;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    (x & 0xff) as u8
+                })
+                .collect()
+        };
+        let big = dir.join("big.bin");
+        let keep = dir.join("keep.bin");
+        std::fs::write(&big, mk(1, 50_000)).unwrap();
+        std::fs::write(&keep, mk(2, 10_000)).unwrap();
+
+        let mut v = Vault::create(&vault_path, 4096).unwrap();
+        v.add_file(&big, "/lixo/big.bin").unwrap();
+        v.add_file(&keep, "keep.bin").unwrap();
+        v.commit().unwrap();
+        let before = v.stats().unique_blocks;
+
+        // mv: renomeia o que vamos manter.
+        v.rename("keep.bin", "/docs/keep.bin").unwrap();
+        // rm -r: remove o diretório inteiro do arquivo grande.
+        let removed = v.remove_dir("/lixo").unwrap();
+        assert_eq!(removed, 1);
+        v.commit().unwrap();
+
+        assert!(v.catalog().files.contains_key("/docs/keep.bin"));
+        assert!(!v.catalog().files.contains_key("/lixo/big.bin"));
+
+        // gc: deve descartar os blocos órfãos do arquivo grande.
+        let report = v.compact_to(&compact_path).unwrap();
+        assert!(report.blocks_after < before, "gc deveria remover blocos órfãos");
+        assert!(report.reclaimed_bytes() > 30_000, "deveria recuperar o arquivo grande");
+
+        // O container compactado ainda abre e o arquivo mantido bate.
+        let mut v2 = Vault::open(&compact_path, None).unwrap();
+        let mut out = Cursor::new(Vec::new());
+        v2.extract("/docs/keep.bin", &mut out).unwrap();
+        assert_eq!(out.into_inner(), std::fs::read(&keep).unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

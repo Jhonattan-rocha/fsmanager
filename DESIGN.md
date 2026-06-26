@@ -50,14 +50,17 @@ uma geração — semente do versionamento.
 - [x] Criptografia: Argon2id (senha→chave) + XChaCha20-Poly1305 por bloco E no
       catálogo (nomes de arquivo não vazam). Token de verificação detecta senha
       errada. Formato v3. CLI: `init -p`, `--password`/env `FSM_PASSWORD`.
+- [x] Semântica de FS: `rm` (arquivo) e `rm -r` (diretório/prefixo), `mv`
+      (arquivo ou subárvore), `ls <prefixo>`, e `gc` (compact_to) que reescreve
+      o container só com blocos alcançáveis — recupera removidos e gerações antigas.
 
 ## Roadmap
 1. **v0** motor + CLI com dedup. ✅
 2. Pipeline: compressão zstd por bloco. ✅
 3. Pipeline: criptografia XChaCha20-Poly1305 + KDF Argon2 (senha → chave-mestra). ✅
-4. Semântica de FS: diretórios reais, remoção, GC de blocos órfãos (hoje o
-   catálogo cresce append-only — gerações antigas viram lixo até o GC).
-5. Snapshots: comando para nomear/listar/restaurar gerações.
+4. Semântica de FS: `rm`/`mv`/`ls <prefixo>`/`gc`. ✅
+5. Snapshots: comando para nomear/listar/restaurar gerações (o append-only já
+   preserva gerações; falta interface e impedir que o `gc` descarte as nomeadas).
 6. Chunking por conteúdo (CDC/FastCDC) para melhor dedup em arquivos editados.
 7. UI (Tauri) — explorador visual (Opção A).
 8. Montagem como drive (WinFsp/FUSE) — o diferencial matador (Opção B).
