@@ -1,5 +1,7 @@
 [workspace]
 members = ["crates/fsm-core", "crates/fsm-cli"]
+# A app Tauri é um projeto Cargo próprio (build via npm/tauri) — fora do workspace.
+exclude = ["apps/fsm-desktop/src-tauri"]
 resolver = "2"
 
 [workspace.package]

@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>fsmanager</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">🗄️</span>
+        <div>
+          <h1>fsmanager</h1>
+          <p class="sub">Gerenciador de container virtual</p>
+        </div>
+      </div>
+      <div id="vaultPath" class="vault-path hidden"></div>
+    </header>
+
+    <!-- Tela inicial: abrir/criar -->
+    <section id="welcome" class="welcome">
+      <div class="card">
+        <h2>Abrir ou criar um cofre</h2>
+        <label class="field">
+          <span>Senha (deixe vazio para sem criptografia)</span>
+          <input id="password" type="password" placeholder="senha do cofre" />
+        </label>
+        <div class="row">
+          <button id="btnOpen" class="primary">📂 Abrir cofre…</button>
+          <button id="btnCreate">✨ Criar cofre…</button>
+        </div>
+        <p id="welcomeError" class="error"></p>
+      </div>
+    </section>
+
+    <!-- Tela do cofre aberto -->
+    <main id="workspace" class="workspace hidden">
+      <div class="stats" id="stats"></div>
+
+      <div class="actions">
+        <button id="btnAdd" class="primary">➕ Adicionar arquivos</button>
+        <button id="btnGc">🧹 Compactar (gc)</button>
+        <button id="btnClose" class="ghost">✕ Fechar</button>
+      </div>
+
+      <div class="panels">
+        <div class="panel">
+          <div class="panel-head">
+            <h3>Arquivos</h3>
+            <input id="filter" class="filter" placeholder="filtrar…" />
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Caminho</th><th class="num">Tamanho</th><th class="num">Modificado</th><th></th></tr>
+              </thead>
+              <tbody id="fileList"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel snapshots">
+          <div class="panel-head">
+            <h3>Snapshots</h3>
+            <button id="btnSnap" class="small">📸 Criar</button>
+          </div>
+          <ul id="snapList" class="snap-list"></ul>
+        </div>
+      </div>
+      <p id="workError" class="error"></p>
+    </main>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <script type="module" src="main.js"></script>
+  </body>
+</html>
