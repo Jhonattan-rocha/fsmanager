@@ -45,19 +45,29 @@ uma geração — semente do versionamento.
 - [x] Workspace Rust: `fsm-core` (motor) + `fsm-cli` (binário `fsm`).
 - [x] Container: init, add, ls, cat, extract, stats.
 - [x] Dedup por conteúdo + validação de integridade na leitura.
-- [x] Compressão zstd no pipeline (byte de método por bloco; fallback p/ cru quando
-      não compensa). `stats` separa dedup × compressão × total. Formato v2.
-- [ ] Pipeline de criptografia: gancho `TODO(pipeline)` após a compressão.
+- [x] Compressão zstd no pipeline (flags por bloco; fallback p/ cru quando
+      não compensa). `stats` separa dedup × compressão × total.
+- [x] Criptografia: Argon2id (senha→chave) + XChaCha20-Poly1305 por bloco E no
+      catálogo (nomes de arquivo não vazam). Token de verificação detecta senha
+      errada. Formato v3. CLI: `init -p`, `--password`/env `FSM_PASSWORD`.
 
 ## Roadmap
 1. **v0** motor + CLI com dedup. ✅
 2. Pipeline: compressão zstd por bloco. ✅
-3. Diretórios reais + remoção + journaling explícito (hoje o catálogo cresce append-only).
-4. Pipeline: criptografia XChaCha20-Poly1305 + KDF Argon2 (senha → chave-mestra).
-5. Snapshots: comando para nomear/listar/restaurar gerações; GC de blocos órfãos.
+3. Pipeline: criptografia XChaCha20-Poly1305 + KDF Argon2 (senha → chave-mestra). ✅
+4. Semântica de FS: diretórios reais, remoção, GC de blocos órfãos (hoje o
+   catálogo cresce append-only — gerações antigas viram lixo até o GC).
+5. Snapshots: comando para nomear/listar/restaurar gerações.
 6. Chunking por conteúdo (CDC/FastCDC) para melhor dedup em arquivos editados.
 7. UI (Tauri) — explorador visual (Opção A).
 8. Montagem como drive (WinFsp/FUSE) — o diferencial matador (Opção B).
+
+## Notas de segurança (pendências honestas)
+- `--password` na linha de comando fica visível na lista de processos / histórico
+  do shell. Para uso real: ler senha via prompt interativo (sem eco) ou só env.
+- Argon2 usa parâmetros `default` da crate (~19 MiB, custo fixo). Parametrizar e
+  gravar os parâmetros no header seria mais robusto a hardware futuro.
+- Sem "rekey"/troca de senha ainda (exigiria re-selar catálogo + token).
 
 ## Como rodar
 ```sh
