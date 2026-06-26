@@ -87,6 +87,16 @@ uma geração — semente do versionamento.
       PERSISTÊNCIA (reabrir o .vault). Funciona com Explorer/PowerShell/apps.
       LIMITAÇÃO conhecida: builtins do cmd.exe (`copy`/`ren`/`del`) têm
       idiossincrasia com WinFsp e falham; operações diretas (CreateFile) funcionam.
+- [x] Mount FUSE/Linux READ-WRITE — módulo `unix` reescrito com estado mutável
+      (tabela de inodes dinâmica + buffers por arquivo). Implementa create/write/
+      mkdir/unlink/rmdir/rename/setattr(truncate)/flush/fsync/release, espelhando o
+      modelo do Windows. ESCRITO contra a API real do `fuser` 0.17, NÃO testado
+      (host Windows) — validar em Linux.
+- [x] Botão "Montar como drive" na UI (Tauri). Comando `mount_drive` FECHA o vault
+      na UI e inicia o `fsm-mount` como PROCESSO separado (não linka — preserva a
+      separação de licença: UI é o app, `fsm-mount` é GPLv3). `unmount_drive` mata o
+      processo. Resolve o binário por env `FSM_MOUNT_BIN`, ao lado do exe, ou
+      subindo ancestrais até `crates/fsm-mount/target/{debug,release}`.
 
 ## Roadmap
 1. **v0** motor + CLI com dedup. ✅
@@ -96,9 +106,37 @@ uma geração — semente do versionamento.
 5. Snapshots: `create/list/restore/delete`, com `gc` respeitando os nomeados. ✅
 6. Chunking por conteúdo (FastCDC) para melhor dedup em arquivos editados. ✅
 7. UI (Tauri) — explorador visual (Opção A). ✅
-8. Montagem como drive: Windows/WinFsp read-only ✅ e READ-WRITE ✅; FUSE/Linux
-   read-only ✅ (a testar em Linux). Próximo: FUSE read-write (espelhar o modelo
-   do Windows no `unix`) e botão "Montar" na UI (Tauri chamando o fsm-mount).
+8. Montagem como drive: Windows/WinFsp read-only ✅ e read-write ✅; FUSE/Linux
+   read-only ✅ e read-write ✅ (a testar em Linux); botão "Montar" na UI ✅.
+   Possíveis melhorias: lidar com os builtins do cmd.exe; spill de buffer grande
+   para arquivo temporário (hoje materializa em RAM); resolução case-insensitive
+   também no FUSE se desejado.
+
+## Performance do mount (notas)
+- USE O BINÁRIO RELEASE (`cargo build --release`): zstd/BLAKE3/FastCDC em debug são
+  5–10× mais lentos — era a causa do "travou em 99%" ao copiar arquivos grandes.
+- `FileEntry.chunks` guarda `ChunkRef { hash, len }` (tamanho inline) — `read_range`
+  calcula offsets sem lookup no índice de blocos, evitando O(n²) por leitura. Formato v7.
+- Cache LRU (FIFO) de blocos decodificados no `Vault` (128 MiB) — acelera leituras
+  repetidas/aleatórias (ex.: WinRAR lendo o diretório do arquivo). Blocos são
+  imutáveis (content-addressed) → nunca ficam obsoletos.
+- `read_range` não re-verifica BLAKE3 (busca-se o bloco PELO hash; cifrados já têm
+  Poly1305) — ganho de ~8%.
+- Espaço livre do drive é ADAPTATIVO: reporta o livre real do disco do host
+  (`GetDiskFreeSpaceExW`), não um valor fixo.
+- ESCRITA STREAMING (`StreamWriter`): escrita sequencial (cópia) é chunkada
+  incrementalmente conforme chega — memória limitada (~poucos chunks) e sem o
+  "freeze" de re-chunkar tudo no fechamento. Escrita fora de ordem cai para
+  materializado. No mount, `create`/`overwrite` abrem em streaming.
+- LEITURA EM LOTE (`prefetch_blocks`): blocos fisicamente contíguos no `.vault`
+  são lidos numa única syscall em vez de uma por bloco.
+- Heurística de compressão por SAMPLE: testa zstd em 8 KB; se não comprime,
+  grava o chunk cru sem tentar comprimir o resto (acelera muito dados já
+  comprimidos: .rar/.jpg/.zip).
+- Throughput medido (300 MB incompressível, release): escrita ~46 MB/s, leitura
+  ~31 MB/s. O teto restante é o IPC do WinFsp + acesso serializado ao vault
+  (CoarseGuard + Mutex). Futuro p/ ir além: leituras paralelas (pread/handles
+  múltiplos), menos cópias, mmap do `.vault`.
 
 ## Mount (crates/fsm-mount) — binário separado
 GPL-3.0 porque linka `winfsp` (GPLv3); por isso é um BINÁRIO À PARTE — `fsm-core`,

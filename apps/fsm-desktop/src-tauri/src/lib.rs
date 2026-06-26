@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 use fsm_core::{Vault, DEFAULT_AVG_CHUNK};
 use serde::Serialize;
-use tauri::State;
+use tauri::{Emitter, State};
 use tauri_plugin_dialog::DialogExt;
 
 /// Vault aberto + contexto necessário para reabrir após `gc`.
@@ -22,6 +22,13 @@ struct OpenVault {
 #[derive(Default)]
 struct AppState {
     open: Mutex<Option<OpenVault>>,
+    mount: Mutex<Option<MountProc>>,
+}
+
+/// Processo `fsm-mount` em execução (binário GPLv3 separado, invocado como processo).
+struct MountProc {
+    child: std::process::Child,
+    mountpoint: String,
 }
 
 // ----------------------- DTOs para a UI -----------------------
@@ -53,6 +60,14 @@ struct StatsDto {
     dedup_savings: f64,
     compression_savings: f64,
     total_savings: f64,
+}
+
+/// Progresso de adição de arquivo, emitido como evento `add-progress`.
+#[derive(Serialize, Clone)]
+struct AddProgress {
+    file: String,
+    done: u64,
+    total: u64,
 }
 
 /// Tudo o que a UI precisa para renderizar o estado atual do vault.
@@ -129,7 +144,7 @@ fn empty_to_none(p: Option<String>) -> Option<String> {
 
 // ----------------------- comandos -----------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 fn create_vault(
     app: tauri::AppHandle,
     state: State<AppState>,
@@ -156,7 +171,7 @@ fn create_vault(
     Ok(info)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn open_vault(
     app: tauri::AppHandle,
     state: State<AppState>,
@@ -189,27 +204,47 @@ fn get_info(state: State<AppState>) -> Result<VaultInfo, String> {
     mutate(&state, |_| Ok(()))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn add_files(app: tauri::AppHandle, state: State<AppState>) -> Result<VaultInfo, String> {
     let picked = app.dialog().file().blocking_pick_files();
     let files = match picked {
         Some(fs) if !fs.is_empty() => fs,
         _ => return Err("nenhum arquivo selecionado".into()),
     };
-    mutate(&state, |v| {
-        for fp in &files {
-            let src = fp.to_string();
-            let dest = Path::new(&src)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "arquivo".into());
-            v.add_file(&src, &dest).map_err(s)?;
-        }
-        v.commit().map_err(s)
-    })
+    let mut guard = state.open.lock().unwrap();
+    let ov = guard.as_mut().ok_or("nenhum container aberto")?;
+    for fp in &files {
+        let src = fp.to_string();
+        let name = Path::new(&src)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "arquivo".into());
+        let total = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
+        let app2 = app.clone();
+        let fname = name.clone();
+        let mut last_emit = 0u64;
+        ov.vault
+            .add_file_progress(&src, &name, |done| {
+                // Throttle: emite a cada ~4 MB (ou no fim) para não inundar a UI.
+                if done.saturating_sub(last_emit) >= 4 * 1024 * 1024 || done >= total {
+                    last_emit = done;
+                    let _ = app2.emit(
+                        "add-progress",
+                        AddProgress {
+                            file: fname.clone(),
+                            done,
+                            total,
+                        },
+                    );
+                }
+            })
+            .map_err(s)?;
+    }
+    ov.vault.commit().map_err(s)?;
+    Ok(build_info(&ov.path, &ov.vault))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn extract_file(
     app: tauri::AppHandle,
     state: State<AppState>,
@@ -283,7 +318,7 @@ fn snapshot_delete(state: State<AppState>, name: String) -> Result<VaultInfo, St
 }
 
 /// Compacta o container: escreve em arquivo temporário, substitui e reabre.
-#[tauri::command]
+#[tauri::command(async)]
 fn gc_vault(state: State<AppState>) -> Result<VaultInfo, String> {
     let mut guard = state.open.lock().unwrap();
     let ov = guard.take().ok_or("nenhum container aberto")?;
@@ -310,6 +345,102 @@ fn gc_vault(state: State<AppState>) -> Result<VaultInfo, String> {
     Ok(info)
 }
 
+/// Localiza o binário `fsm-mount` (env `FSM_MOUNT_BIN`, ao lado do exe, ou alvos de dev).
+fn resolve_mount_bin() -> Result<std::path::PathBuf, String> {
+    let name = if cfg!(windows) {
+        "fsm-mount.exe"
+    } else {
+        "fsm-mount"
+    };
+    if let Ok(p) = std::env::var("FSM_MOUNT_BIN") {
+        let pb = std::path::PathBuf::from(p);
+        if pb.exists() {
+            return Ok(pb);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let dir = exe.parent();
+        // 1) ao lado do exe (caso de produção: empacotados juntos).
+        if let Some(d) = dir {
+            let sibling = d.join(name);
+            if sibling.exists() {
+                return Ok(sibling);
+            }
+        }
+        // 2) dev: sobe pelos ancestrais procurando crates/fsm-mount/target/{debug,release}.
+        let mut cur = dir;
+        for _ in 0..8 {
+            let Some(d) = cur else { break };
+            for prof in ["debug", "release"] {
+                let cand = d
+                    .join("crates/fsm-mount/target")
+                    .join(prof)
+                    .join(name);
+                if cand.exists() {
+                    return Ok(cand);
+                }
+            }
+            cur = d.parent();
+        }
+    }
+    Err(format!(
+        "binário {name} não encontrado — defina a variável de ambiente FSM_MOUNT_BIN"
+    ))
+}
+
+/// Monta o vault aberto como drive: FECHA o vault na UI (libera o arquivo) e
+/// inicia o `fsm-mount` como processo separado no ponto de montagem dado.
+#[tauri::command]
+fn mount_drive(state: State<AppState>, mountpoint: String) -> Result<String, String> {
+    if state.mount.lock().unwrap().is_some() {
+        return Err("já existe um drive montado".into());
+    }
+    let (vault_path, password) = {
+        let guard = state.open.lock().unwrap();
+        let ov = guard.as_ref().ok_or("nenhum container aberto")?;
+        (ov.path.clone(), ov.password.clone())
+    };
+    let bin = resolve_mount_bin()?;
+
+    // Fecha o vault na UI ANTES de montar (evita dois escritores no mesmo arquivo).
+    *state.open.lock().unwrap() = None;
+
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg(&vault_path).arg(&mountpoint);
+    if let Some(pw) = &password {
+        cmd.arg("--password").arg(pw);
+    }
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("falha ao iniciar {}: {e}", bin.display()))?;
+    *state.mount.lock().unwrap() = Some(MountProc {
+        child,
+        mountpoint: mountpoint.clone(),
+    });
+    Ok(mountpoint)
+}
+
+/// Desmonta o drive: encerra o processo `fsm-mount`.
+#[tauri::command]
+fn unmount_drive(state: State<AppState>) -> Result<(), String> {
+    if let Some(mut m) = state.mount.lock().unwrap().take() {
+        let _ = m.child.kill();
+        let _ = m.child.wait();
+    }
+    Ok(())
+}
+
+/// Ponto de montagem atual, se houver drive montado.
+#[tauri::command]
+fn mount_status(state: State<AppState>) -> Option<String> {
+    state
+        .mount
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|m| m.mountpoint.clone())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -329,6 +460,9 @@ pub fn run() {
             snapshot_restore,
             snapshot_delete,
             gc_vault,
+            mount_drive,
+            unmount_drive,
+            mount_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

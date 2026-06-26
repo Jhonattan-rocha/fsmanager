@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use fsm_core::{NodeKind, Vault};
+use fsm_core::{NodeKind, StreamWriter, Vault};
 use winfsp::filesystem::{
     DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo,
     VolumeInfo, WideNameInfo,
@@ -34,18 +34,35 @@ const FSP_CLEANUP_DELETE: u32 = 0x01;
 struct FsmFs {
     vault: Mutex<Vault>,
     sd: Vec<u8>,
-    total: u64,
-    free: u64,
+    /// Diretório do host onde o `.vault` vive (para reportar espaço livre real).
+    vault_dir: String,
     label: String,
+}
+
+/// Espaço livre real (bytes) no volume do host que contém `dir`.
+fn host_free_bytes(dir: &str) -> u64 {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let wide: Vec<u16> = dir.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut free_avail = 0u64;
+    // SAFETY: ponteiro válido para string terminada em nul; saída opcional.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(PCWSTR(wide.as_ptr()), Some(&mut free_avail), None, None).is_ok()
+    };
+    if ok {
+        free_avail
+    } else {
+        4u64 << 30 // fallback
+    }
 }
 
 /// Estado mutável de um handle aberto.
 struct HState {
-    /// Conteúdo materializado (válido quando `loaded`).
-    buf: Vec<u8>,
-    /// `buf` reflete o conteúdo do arquivo.
-    loaded: bool,
-    /// `buf` tem alterações não persistidas.
+    /// Escritor streaming (criação/overwrite sequencial). Tem prioridade.
+    writer: Option<StreamWriter>,
+    /// Conteúdo materializado (modo aleatório / após carregar para editar).
+    buf: Option<Vec<u8>>,
+    /// Há alterações não persistidas.
     dirty: bool,
 }
 
@@ -58,15 +75,23 @@ struct Handle {
 }
 
 impl Handle {
-    fn new(path: String, is_dir: bool, loaded: bool) -> Self {
+    /// Handle só-leitura (ou base): nada materializado ainda.
+    fn reading(path: String, is_dir: bool) -> Self {
+        Self::with_state(path, is_dir, HState { writer: None, buf: None, dirty: false })
+    }
+    /// Handle de escrita streaming (create/overwrite).
+    fn writing(path: String, writer: StreamWriter) -> Self {
+        Self::with_state(
+            path,
+            false,
+            HState { writer: Some(writer), buf: None, dirty: true },
+        )
+    }
+    fn with_state(path: String, is_dir: bool, state: HState) -> Self {
         Handle {
             path,
             is_dir,
-            state: Mutex::new(HState {
-                buf: Vec::new(),
-                loaded,
-                dirty: false,
-            }),
+            state: Mutex::new(state),
             dir_buffer: DirBuffer::new(),
         }
     }
@@ -152,30 +177,55 @@ fn copy_sd(sd: &[u8], dst: Option<&mut [c_void]>) {
 }
 
 impl FsmFs {
-    /// Garante que `st.buf` contém o conteúdo atual do arquivo.
-    fn ensure_loaded(&self, ctx: &Handle, st: &mut HState) -> winfsp::Result<()> {
-        if st.loaded {
+    /// Garante que `st.buf` contém o conteúdo atual (materializa o writer streaming
+    /// ou carrega do vault). Sai do modo streaming.
+    fn ensure_buf(&self, ctx: &Handle, st: &mut HState) -> winfsp::Result<()> {
+        if st.buf.is_some() {
             return Ok(());
         }
         let mut v = self.vault.lock().unwrap();
-        let size = match v.resolve(&ctx.path) {
-            Some(NodeKind::File { size, .. }) => size,
-            _ => 0,
+        let buf = if let Some(w) = st.writer.take() {
+            v.writer_to_buffer(w).map_err(io_fsp)?
+        } else {
+            let size = match v.resolve(&ctx.path) {
+                Some(NodeKind::File { size, .. }) => size,
+                _ => 0,
+            };
+            v.read_range(&ctx.path, 0, size as usize).map_err(io_fsp)?
         };
-        st.buf = v.read_range(&ctx.path, 0, size as usize).map_err(io_fsp)?;
-        st.loaded = true;
+        st.buf = Some(buf);
         Ok(())
     }
 
-    /// Persiste o buffer sujo no container.
-    fn flush_dirty(&self, ctx: &Handle, st: &mut HState) -> winfsp::Result<()> {
-        if st.dirty {
-            let mut v = self.vault.lock().unwrap();
-            v.write_file(&ctx.path, &st.buf, now_secs()).map_err(io_fsp)?;
+    /// Persiste as alterações: finaliza o writer streaming OU grava o buffer.
+    fn persist(&self, ctx: &Handle, st: &mut HState) -> winfsp::Result<()> {
+        let mut v = self.vault.lock().unwrap();
+        if let Some(w) = st.writer.take() {
+            v.finish_write(w, &ctx.path, now_secs()).map_err(io_fsp)?;
             v.commit().map_err(io_fsp)?;
+            st.dirty = false;
+        } else if st.dirty {
+            if let Some(buf) = &st.buf {
+                v.write_file(&ctx.path, buf, now_secs()).map_err(io_fsp)?;
+                v.commit().map_err(io_fsp)?;
+            }
             st.dirty = false;
         }
         Ok(())
+    }
+
+    /// Tamanho atual do arquivo aberto (writer streaming, buffer, ou catálogo).
+    fn cur_size(&self, ctx: &Handle, st: &HState) -> u64 {
+        if let Some(w) = &st.writer {
+            return w.len();
+        }
+        if let Some(b) = &st.buf {
+            return b.len() as u64;
+        }
+        match self.vault.lock().unwrap().resolve(&ctx.path) {
+            Some(NodeKind::File { size, .. }) => size,
+            _ => 0,
+        }
     }
 }
 
@@ -224,7 +274,7 @@ impl FileSystemContext for FsmFs {
         let is_dir = matches!(kind, NodeKind::Dir);
         fill_from_kind(file_info.as_mut(), &kind);
         set_norm(file_info, &real);
-        Ok(Handle::new(real, is_dir, false))
+        Ok(Handle::reading(real, is_dir))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -249,20 +299,21 @@ impl FileSystemContext for FsmFs {
         }
         if is_dir {
             v.create_dir(&path).map_err(io_fsp)?;
-        } else {
-            v.write_file(&path, &[], now_secs()).map_err(io_fsp)?;
-        }
-        v.commit().map_err(io_fsp)?;
-        drop(v);
-
-        if is_dir {
+            v.commit().map_err(io_fsp)?;
+            drop(v);
             fill_dir(file_info.as_mut());
+            set_norm(file_info, &path);
+            Ok(Handle::reading(path, true))
         } else {
+            // Cria o arquivo vazio (aparece no catálogo) e abre em modo streaming.
+            v.write_file(&path, &[], now_secs()).map_err(io_fsp)?;
+            v.commit().map_err(io_fsp)?;
+            let writer = v.stream_writer();
+            drop(v);
             fill_file(file_info.as_mut(), 0, now_secs());
+            set_norm(file_info, &path);
+            Ok(Handle::writing(path, writer))
         }
-        set_norm(file_info, &path);
-        // Novo arquivo: buffer vazio já reflete o conteúdo (loaded).
-        Ok(Handle::new(path, is_dir, !is_dir))
     }
 
     fn close(&self, _context: Handle) {}
@@ -273,17 +324,7 @@ impl FileSystemContext for FsmFs {
             return Ok(());
         }
         let st = context.state.lock().unwrap();
-        if st.loaded {
-            fill_file(file_info, st.buf.len() as u64, now_secs());
-        } else {
-            let kind = self
-                .vault
-                .lock()
-                .unwrap()
-                .resolve(&context.path)
-                .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
-            fill_from_kind(file_info, &kind);
-        }
+        fill_file(file_info, self.cur_size(context, &st), now_secs());
         Ok(())
     }
 
@@ -297,8 +338,11 @@ impl FileSystemContext for FsmFs {
     }
 
     fn get_volume_info(&self, out: &mut VolumeInfo) -> winfsp::Result<()> {
-        out.total_size = self.total;
-        out.free_size = self.free;
+        // Adaptativo: livre = espaço real do host; total = usado + livre.
+        let used = self.vault.lock().unwrap().stats().logical_bytes;
+        let free = host_free_bytes(&self.vault_dir);
+        out.total_size = used + free;
+        out.free_size = free;
         out.set_volume_label(&self.label);
         Ok(())
     }
@@ -307,15 +351,18 @@ impl FileSystemContext for FsmFs {
         if context.is_dir {
             return Err(STATUS_INVALID_PARAMETER.into());
         }
-        let st = context.state.lock().unwrap();
-        if st.loaded {
-            // Serve do buffer (fonte da verdade após edição).
-            if offset as usize >= st.buf.len() {
+        let mut st = context.state.lock().unwrap();
+        // Leitura no meio de uma escrita streaming: materializa para servir.
+        if st.writer.is_some() {
+            self.ensure_buf(context, &mut st)?;
+        }
+        if let Some(buf) = &st.buf {
+            if offset as usize >= buf.len() {
                 return Err(STATUS_END_OF_FILE.into());
             }
             let from = offset as usize;
-            let to = (from + buffer.len()).min(st.buf.len());
-            buffer[..to - from].copy_from_slice(&st.buf[from..to]);
+            let to = (from + buffer.len()).min(buf.len());
+            buffer[..to - from].copy_from_slice(&buf[from..to]);
             Ok((to - from) as u32)
         } else {
             drop(st);
@@ -346,33 +393,51 @@ impl FileSystemContext for FsmFs {
             return Err(STATUS_INVALID_PARAMETER.into());
         }
         let mut st = context.state.lock().unwrap();
-        self.ensure_loaded(context, &mut st)?;
 
-        let len = st.buf.len() as u64;
+        // Caminho STREAMING (criação/overwrite sequencial): chunka incremental.
+        // Escrita fora de ordem cai para materializado dentro do stream_write.
+        if st.writer.is_some() && !constrained_io {
+            let at = if write_to_eof {
+                st.writer.as_ref().unwrap().len()
+            } else {
+                offset
+            };
+            {
+                let mut v = self.vault.lock().unwrap();
+                v.stream_write(st.writer.as_mut().unwrap(), at, buffer)
+                    .map_err(io_fsp)?;
+            }
+            st.dirty = true;
+            let size = st.writer.as_ref().unwrap().len();
+            fill_file(file_info, size, now_secs());
+            return Ok(buffer.len() as u32);
+        }
+
+        // Caminho MATERIALIZADO.
+        self.ensure_buf(context, &mut st)?;
+        let buf = st.buf.as_mut().unwrap();
+        let len = buf.len() as u64;
         let at = if write_to_eof { len } else { offset };
-
         let written = if constrained_io {
-            // Não pode estender o arquivo (cache manager).
             if at >= len {
                 0
             } else {
                 let end = (at + buffer.len() as u64).min(len);
                 let n = (end - at) as usize;
-                st.buf[at as usize..end as usize].copy_from_slice(&buffer[..n]);
-                st.dirty = true;
+                buf[at as usize..end as usize].copy_from_slice(&buffer[..n]);
                 n
             }
         } else {
             let end = at + buffer.len() as u64;
-            if end as usize > st.buf.len() {
-                st.buf.resize(end as usize, 0);
+            if end as usize > buf.len() {
+                buf.resize(end as usize, 0);
             }
-            st.buf[at as usize..end as usize].copy_from_slice(buffer);
-            st.dirty = true;
+            buf[at as usize..end as usize].copy_from_slice(buffer);
             buffer.len()
         };
-
-        fill_file(file_info, st.buf.len() as u64, now_secs());
+        st.dirty = true;
+        let new_size = st.buf.as_ref().unwrap().len() as u64;
+        fill_file(file_info, new_size, now_secs());
         Ok(written as u32)
     }
 
@@ -388,9 +453,11 @@ impl FileSystemContext for FsmFs {
         if context.is_dir {
             return Err(STATUS_INVALID_PARAMETER.into());
         }
+        // Overwrite (CREATE_ALWAYS/TRUNCATE): zera e reabre em streaming.
+        let writer = self.vault.lock().unwrap().stream_writer();
         let mut st = context.state.lock().unwrap();
-        st.buf.clear();
-        st.loaded = true;
+        st.writer = Some(writer);
+        st.buf = None;
         st.dirty = true;
         fill_file(file_info, 0, now_secs());
         Ok(())
@@ -407,10 +474,18 @@ impl FileSystemContext for FsmFs {
             return Err(STATUS_INVALID_PARAMETER.into());
         }
         let mut st = context.state.lock().unwrap();
-        self.ensure_loaded(context, &mut st)?;
-        st.buf.resize(new_size as usize, 0);
-        st.dirty = true;
-        fill_file(file_info, st.buf.len() as u64, now_secs());
+        // Em streaming, ignorar extensão/preallocação (N >= já escrito) e seguir
+        // chunkando; só truncar de verdade (N menor) força materializar.
+        let keep_streaming = match &st.writer {
+            Some(w) => new_size >= w.len(),
+            None => false,
+        };
+        if !keep_streaming {
+            self.ensure_buf(context, &mut st)?;
+            st.buf.as_mut().unwrap().resize(new_size as usize, 0);
+            st.dirty = true;
+        }
+        fill_file(file_info, self.cur_size(context, &st), now_secs());
         Ok(())
     }
 
@@ -463,8 +538,12 @@ impl FileSystemContext for FsmFs {
         match context {
             Some(ctx) if !ctx.is_dir => {
                 let mut st = ctx.state.lock().unwrap();
-                self.flush_dirty(ctx, &mut st)?;
-                fill_file(file_info, st.buf.len() as u64, now_secs());
+                // Streaming não é finalizado no flush (não dá para continuar
+                // depois); persistimos só buffer materializado sujo.
+                if st.writer.is_none() && st.dirty {
+                    self.persist(ctx, &mut st)?;
+                }
+                fill_file(file_info, self.cur_size(ctx, &st), now_secs());
             }
             Some(_) => fill_dir(file_info),
             None => {
@@ -484,9 +563,10 @@ impl FileSystemContext for FsmFs {
                 let _ = v.remove(&context.path);
             }
             let _ = v.commit();
+            st.writer = None;
             st.dirty = false;
         } else {
-            let _ = self.flush_dirty(context, &mut st);
+            let _ = self.persist(context, &mut st);
         }
     }
 
@@ -568,15 +648,16 @@ pub fn mount(vault_path: &str, mountpoint: &str, password: Option<&str>) -> Resu
     winfsp::winfsp_init().map_err(|e| anyhow::anyhow!("winfsp_init falhou: {e:?}"))?;
 
     let vault = Vault::open(vault_path, password).context("abrindo container")?;
-    let used = vault.stats().logical_bytes;
-    let free = 4u64 << 30; // 4 GiB virtuais livres
-    let total = used + free;
+    let vault_dir = std::path::Path::new(vault_path)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ".".to_string());
 
     let context = FsmFs {
         vault: Mutex::new(vault),
         sd: make_security_descriptor()?,
-        total,
-        free,
+        vault_dir,
         label: "fsmanager".to_string(),
     };
 

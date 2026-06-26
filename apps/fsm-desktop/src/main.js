@@ -1,4 +1,5 @@
 const { invoke } = window.__TAURI__.core;
+const tauriEvent = window.__TAURI__.event;
 
 // ----------------------- estado da UI -----------------------
 let current = null; // último VaultInfo recebido
@@ -30,13 +31,15 @@ function $(id) {
 }
 
 let toastTimer = null;
-function toast(msg, isError = false) {
+function toast(msg, isError = false, sticky = false) {
   const el = $("toast");
   el.textContent = msg;
   el.classList.toggle("error", isError);
   el.classList.remove("hidden");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.add("hidden"), 3200);
+  if (!sticky) {
+    toastTimer = setTimeout(() => el.classList.add("hidden"), 3200);
+  }
 }
 
 async function call(cmd, args = {}) {
@@ -48,7 +51,16 @@ function showWelcome() {
   current = null;
   $("welcome").classList.remove("hidden");
   $("workspace").classList.add("hidden");
+  $("mounted").classList.add("hidden");
   $("vaultPath").classList.add("hidden");
+}
+
+function showMounted(mountpoint) {
+  current = null;
+  $("welcome").classList.add("hidden");
+  $("workspace").classList.add("hidden");
+  $("mounted").classList.remove("hidden");
+  $("mountAt").textContent = mountpoint;
 }
 
 function render(info) {
@@ -160,8 +172,22 @@ function password() {
 
 // ----------------------- wiring -----------------------
 window.addEventListener("DOMContentLoaded", () => {
+  // Progresso de adição de arquivos (evento emitido pelo backend).
+  if (tauriEvent && tauriEvent.listen) {
+    tauriEvent.listen("add-progress", (e) => {
+      const { file, done, total } = e.payload || {};
+      const pct = total ? Math.round((done / total) * 100) : 0;
+      toast(
+        `⏳ Adicionando ${file} — ${pct}%  (${fmtBytes(done)} / ${fmtBytes(total)})`,
+        false,
+        true
+      );
+    });
+  }
+
   $("btnOpen").addEventListener("click", () =>
     guarded(async () => {
+      toast("⏳ Abrindo cofre…", false, true);
       const info = await call("open_vault", { password: password() });
       render(info);
       toast("cofre aberto");
@@ -170,6 +196,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
   $("btnCreate").addEventListener("click", () =>
     guarded(async () => {
+      toast("⏳ Criando cofre…", false, true);
       const info = await call("create_vault", { password: password() });
       render(info);
       toast("cofre criado");
@@ -185,6 +212,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
   $("btnAdd").addEventListener("click", () =>
     guarded(async () => {
+      toast("⏳ Adicionando… arquivos grandes podem levar um tempo", false, true);
       const info = await call("add_files");
       render(info);
       toast("arquivos adicionados");
@@ -193,10 +221,34 @@ window.addEventListener("DOMContentLoaded", () => {
 
   $("btnGc").addEventListener("click", () =>
     guarded(async () => {
+      toast("⏳ Compactando…", false, true);
       const info = await call("gc_vault");
       render(info);
       toast("container compactado");
     })
+  );
+
+  $("btnMount").addEventListener("click", () =>
+    guarded(async () => {
+      const isWin = navigator.userAgent.includes("Windows");
+      const def = isWin ? "X:" : "/mnt/fsm";
+      const hint = isWin
+        ? "Letra de drive (ex: X:)"
+        : "Diretório de montagem (ex: /mnt/fsm — deve existir)";
+      const mp = prompt(hint, def);
+      if (!mp) return;
+      const at = await call("mount_drive", { mountpoint: mp });
+      showMounted(at);
+      toast(`montado em ${at}`);
+    })
+  );
+
+  $("btnUnmount").addEventListener("click", () =>
+    guarded(async () => {
+      await call("unmount_drive");
+      showWelcome();
+      toast("desmontado");
+    }, "mountError")
   );
 
   $("btnSnap").addEventListener("click", () =>

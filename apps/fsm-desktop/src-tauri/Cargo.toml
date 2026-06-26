@@ -24,6 +24,24 @@ strip = "debuginfo"
 [profile.dev.build-override]
 debug = false
 
+# Otimiza as crates pesadas (compressão/hash/chunking) MESMO em `tauri dev`,
+# mantendo o app em debug para iteração rápida. Sem isso, adicionar arquivos
+# grandes pela UI em dev é lentíssimo.
+[profile.dev.package.fsm-core]
+opt-level = 3
+[profile.dev.package.zstd]
+opt-level = 3
+[profile.dev.package.zstd-sys]
+opt-level = 3
+[profile.dev.package.blake3]
+opt-level = 3
+[profile.dev.package.fastcdc]
+opt-level = 3
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.chacha20poly1305]
+opt-level = 3
+
 # Release otimizado para tamanho (disco apertado + binário de distribuição menor).
 [profile.release]
 strip = true

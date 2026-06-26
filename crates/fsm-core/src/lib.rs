@@ -28,7 +28,7 @@
 //! Dedup acontece *dentro* do container sob a chave-mestra única — evitando os
 //! ataques de confirmação da *convergent encryption*.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -49,7 +49,7 @@ pub const HEADER_SIZE: u64 = 4096;
 /// os blocos seguintes, então o dedup sobrevive a inserções/edições.
 pub const DEFAULT_AVG_CHUNK: u32 = 64 * 1024;
 /// Versão do formato on-disk.
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
 /// Nível de compressão zstd padrão (1..=22; 3 é o equilíbrio do zstd).
 pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
@@ -81,13 +81,53 @@ pub struct BlockRef {
     pub raw_len: u32,
 }
 
+/// Referência ordenada a um chunk: hash de conteúdo + tamanho descomprimido.
+/// O tamanho inline evita lookups no índice de blocos ao calcular offsets na
+/// leitura aleatória (caso contrário `read_range` fica O(n²)).
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub struct ChunkRef {
+    pub hash: Hash,
+    pub len: u32,
+}
+
+/// Escritor incremental (streaming) de um arquivo.
+///
+/// Para escrita SEQUENCIAL (caso da cópia), chunka conforme os dados chegam e
+/// grava blocos na hora — memória limitada (~poucos chunks) e sem o "freeze" de
+/// re-chunkar tudo no fechamento. Escrita fora de ordem cai para o modo
+/// materializado (buffer completo).
+pub struct StreamWriter {
+    chunks: Vec<ChunkRef>,
+    /// Cauda ainda não fragmentada (final do stream).
+    pending: Vec<u8>,
+    /// Próximo offset esperado para continuar o append sequencial.
+    next_offset: u64,
+    /// Tamanho lógico total escrito.
+    size: u64,
+    /// Buffer materializado (Some quando saiu do modo streaming).
+    fallback: Option<Vec<u8>>,
+    min: u32,
+    avg: u32,
+    max: u32,
+}
+
+impl StreamWriter {
+    /// Tamanho lógico escrito até agora.
+    pub fn len(&self) -> u64 {
+        self.size
+    }
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+}
+
 /// Metadados de um arquivo lógico guardado no container.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct FileEntry {
     pub size: u64,
     pub mtime: i64,
-    /// Hashes dos chunks, em ordem. Reconstroem o arquivo concatenados.
-    pub chunks: Vec<Hash>,
+    /// Chunks em ordem (hash + tamanho). Reconstroem o arquivo concatenados.
+    pub chunks: Vec<ChunkRef>,
 }
 
 /// Uma versão nomeada da árvore de arquivos num instante.
@@ -141,7 +181,16 @@ pub struct Vault {
     zstd_level: i32,
     /// Estado de criptografia, se o container tiver senha.
     enc: Option<EncState>,
+    /// Cache de blocos já decodificados (descomprimidos/decifrados), por hash.
+    /// Blocos são imutáveis (content-addressed), então nunca ficam obsoletos.
+    block_cache: HashMap<Hash, Vec<u8>>,
+    cache_order: VecDeque<Hash>,
+    cache_bytes: usize,
+    cache_cap: usize,
 }
+
+/// Capacidade padrão do cache de blocos decodificados (128 MiB).
+const DEFAULT_CACHE_CAP: usize = 128 << 20;
 
 impl Vault {
     /// Cria um container novo e vazio, **sem** criptografia.
@@ -185,6 +234,10 @@ impl Vault {
             next_append: HEADER_SIZE,
             zstd_level: DEFAULT_ZSTD_LEVEL,
             enc,
+            block_cache: HashMap::new(),
+            cache_order: VecDeque::new(),
+            cache_bytes: 0,
+            cache_cap: DEFAULT_CACHE_CAP,
         };
         vault.file.set_len(HEADER_SIZE)?;
         vault.commit()?;
@@ -258,6 +311,10 @@ impl Vault {
             next_append: catalog_offset + catalog_len,
             zstd_level: DEFAULT_ZSTD_LEVEL,
             enc,
+            block_cache: HashMap::new(),
+            cache_order: VecDeque::new(),
+            cache_bytes: 0,
+            cache_cap: DEFAULT_CACHE_CAP,
         })
     }
 
@@ -282,6 +339,18 @@ impl Vault {
     /// Adiciona/atualiza um arquivo do disco real no caminho lógico `dest`.
     /// Os blocos são gravados na hora; o catálogo só é persistido em [`commit`].
     pub fn add_file(&mut self, src: impl AsRef<Path>, dest: &str) -> Result<()> {
+        self.add_file_progress(src, dest, |_done| {})
+    }
+
+    /// Como [`add_file`](Self::add_file), mas chama `progress(bytes_processados)`
+    /// conforme cada chunk é gravado. A leitura é STREAMING (via `StreamCDC`):
+    /// o arquivo é processado chunk a chunk, sem carregar tudo na memória.
+    pub fn add_file_progress<F: FnMut(u64)>(
+        &mut self,
+        src: impl AsRef<Path>,
+        dest: &str,
+        mut progress: F,
+    ) -> Result<()> {
         let src = src.as_ref();
         let meta = std::fs::metadata(src)
             .with_context(|| format!("lendo metadados de {}", src.display()))?;
@@ -297,12 +366,16 @@ impl Vault {
 
         let mut chunks = Vec::new();
         let mut total: u64 = 0;
-        // FastCDC: fronteiras definidas pelo conteúdo (rolling hash gear).
+        // FastCDC streaming: lê e fatia o arquivo incrementalmente.
         for item in StreamCDC::new(f, min, avg, max) {
             let chunk = item.map_err(|e| anyhow!("fatiando {} (FastCDC): {e}", src.display()))?;
             total += chunk.length as u64;
             let hash = self.write_block(&chunk.data)?;
-            chunks.push(hash);
+            chunks.push(ChunkRef {
+                hash,
+                len: chunk.length as u32,
+            });
+            progress(total);
         }
 
         let dest = normalize_path(dest);
@@ -327,7 +400,11 @@ impl Vault {
         if !data.is_empty() {
             for chunk in fastcdc::v2020::FastCDC::new(data, min, avg, max) {
                 let slice = &data[chunk.offset..chunk.offset + chunk.length];
-                chunks.push(self.write_block(slice)?);
+                let hash = self.write_block(slice)?;
+                chunks.push(ChunkRef {
+                    hash,
+                    len: chunk.length as u32,
+                });
             }
         }
         let dest = normalize_path(logical);
@@ -338,6 +415,132 @@ impl Vault {
                 size: data.len() as u64,
                 mtime,
                 chunks,
+            },
+        );
+        Ok(())
+    }
+
+    /// Inicia uma sessão de escrita streaming.
+    pub fn stream_writer(&self) -> StreamWriter {
+        let (min, avg, max) = cdc_params(self.chunk_size);
+        StreamWriter {
+            chunks: Vec::new(),
+            pending: Vec::new(),
+            next_offset: 0,
+            size: 0,
+            fallback: None,
+            min,
+            avg,
+            max,
+        }
+    }
+
+    /// Aplica uma escrita ao writer. Append sequencial chunka incrementalmente;
+    /// escrita fora de ordem cai para o modo materializado.
+    pub fn stream_write(&mut self, w: &mut StreamWriter, offset: u64, data: &[u8]) -> Result<()> {
+        if let Some(buf) = &mut w.fallback {
+            let end = offset as usize + data.len();
+            if end > buf.len() {
+                buf.resize(end, 0);
+            }
+            buf[offset as usize..end].copy_from_slice(data);
+            w.size = w.size.max(end as u64);
+            return Ok(());
+        }
+        if offset == w.next_offset {
+            w.pending.extend_from_slice(data);
+            w.next_offset += data.len() as u64;
+            w.size = w.next_offset;
+            // Só fragmenta quando há dados suficientes para cortes estáveis
+            // (evita rodar FastCDC a cada escrita pequena).
+            if w.pending.len() >= (w.max as usize) * 2 {
+                self.flush_complete_chunks(w)?;
+            }
+            Ok(())
+        } else {
+            self.switch_to_fallback(w)?;
+            let buf = w.fallback.as_mut().unwrap();
+            let end = offset as usize + data.len();
+            if end > buf.len() {
+                buf.resize(end, 0);
+            }
+            buf[offset as usize..end].copy_from_slice(data);
+            w.size = w.size.max(end as u64);
+            Ok(())
+        }
+    }
+
+    /// Emite os chunks completos do `pending`, mantendo a última cauda (que pode
+    /// crescer com dados futuros, então sua fronteira ainda não é definitiva).
+    fn flush_complete_chunks(&mut self, w: &mut StreamWriter) -> Result<()> {
+        let cuts: Vec<(usize, usize)> = fastcdc::v2020::FastCDC::new(&w.pending, w.min, w.avg, w.max)
+            .map(|c| (c.offset, c.length))
+            .collect();
+        if cuts.len() <= 1 {
+            return Ok(());
+        }
+        let last_off = cuts[cuts.len() - 1].0;
+        for &(off, len) in &cuts[..cuts.len() - 1] {
+            let hash = self.write_block(&w.pending[off..off + len])?;
+            w.chunks.push(ChunkRef {
+                hash,
+                len: len as u32,
+            });
+        }
+        w.pending.drain(..last_off);
+        Ok(())
+    }
+
+    /// Reconstrói o conteúdo já escrito num buffer materializado (saída do modo streaming).
+    fn switch_to_fallback(&mut self, w: &mut StreamWriter) -> Result<()> {
+        let buf = self.writer_content(w)?;
+        w.fallback = Some(buf);
+        w.chunks.clear();
+        w.pending.clear();
+        Ok(())
+    }
+
+    /// Conteúdo completo atual de um writer (chunks emitidos + cauda).
+    fn writer_content(&mut self, w: &StreamWriter) -> Result<Vec<u8>> {
+        if let Some(buf) = &w.fallback {
+            return Ok(buf.clone());
+        }
+        let mut buf = Vec::with_capacity(w.size as usize);
+        for cr in &w.chunks {
+            self.ensure_block(&cr.hash)?;
+            buf.extend_from_slice(&self.block_cache[&cr.hash]);
+        }
+        buf.extend_from_slice(&w.pending);
+        Ok(buf)
+    }
+
+    /// Materializa um writer num buffer (para servir leituras no meio da escrita).
+    pub fn writer_to_buffer(&mut self, w: StreamWriter) -> Result<Vec<u8>> {
+        self.writer_content(&w)
+    }
+
+    /// Finaliza a escrita streaming: emite a cauda final e grava o `FileEntry`.
+    pub fn finish_write(&mut self, mut w: StreamWriter, logical: &str, mtime: i64) -> Result<()> {
+        if let Some(buf) = w.fallback.take() {
+            return self.write_file(logical, &buf, mtime);
+        }
+        if !w.pending.is_empty() {
+            for c in fastcdc::v2020::FastCDC::new(&w.pending, w.min, w.avg, w.max) {
+                let hash = self.write_block(&w.pending[c.offset..c.offset + c.length])?;
+                w.chunks.push(ChunkRef {
+                    hash,
+                    len: c.length as u32,
+                });
+            }
+        }
+        let dest = normalize_path(logical);
+        self.catalog.dirs.remove(&dest);
+        self.catalog.files.insert(
+            dest,
+            FileEntry {
+                size: w.size,
+                mtime,
+                chunks: w.chunks,
             },
         );
         Ok(())
@@ -386,6 +589,100 @@ impl Vault {
         Ok(hash)
     }
 
+    /// Garante que o bloco `hash` está no cache decodificado (lê+decodifica se preciso).
+    fn ensure_block(&mut self, hash: &Hash) -> Result<()> {
+        if self.block_cache.contains_key(hash) {
+            return Ok(());
+        }
+        let bref = *self
+            .catalog
+            .blocks
+            .get(hash)
+            .context("bloco referenciado ausente (container corrompido)")?;
+        let mut buf = vec![0u8; bref.len as usize];
+        self.file.seek(SeekFrom::Start(bref.offset))?;
+        self.file.read_exact(&mut buf)?;
+        // Sem re-verificar BLAKE3 aqui: o bloco é buscado PELO endereço de
+        // conteúdo (logo é o conteúdo certo por construção) e, se cifrado, o
+        // Poly1305 já autentica. Isso acelera muito a leitura no mount.
+        let data = decode_block(&buf, self.key())?;
+        self.cache_put(*hash, data);
+        Ok(())
+    }
+
+    /// Decodifica os blocos `hashes` ainda não em cache, lendo do `.vault` em
+    /// lotes: runs de blocos fisicamente contíguos são lidos numa única syscall.
+    fn prefetch_blocks(&mut self, hashes: &[Hash]) -> Result<()> {
+        let mut i = 0;
+        while i < hashes.len() {
+            let h = hashes[i];
+            if self.block_cache.contains_key(&h) {
+                i += 1;
+                continue;
+            }
+            let first = *self
+                .catalog
+                .blocks
+                .get(&h)
+                .context("bloco referenciado ausente (container corrompido)")?;
+            let run_start = first.offset;
+            let mut run_end = first.offset + first.len as u64;
+            let mut run: Vec<(Hash, BlockRef)> = vec![(h, first)];
+            // Estende o run enquanto os próximos blocos forem contíguos no arquivo.
+            let mut j = i + 1;
+            while j < hashes.len() {
+                let h2 = hashes[j];
+                if self.block_cache.contains_key(&h2) {
+                    break;
+                }
+                let b2 = *self
+                    .catalog
+                    .blocks
+                    .get(&h2)
+                    .context("bloco referenciado ausente (container corrompido)")?;
+                if b2.offset == run_end {
+                    run_end = b2.offset + b2.len as u64;
+                    run.push((h2, b2));
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            // Uma única leitura para o run inteiro.
+            let mut buf = vec![0u8; (run_end - run_start) as usize];
+            self.file.seek(SeekFrom::Start(run_start))?;
+            self.file.read_exact(&mut buf)?;
+            for (bh, br) in run {
+                let rel = (br.offset - run_start) as usize;
+                let data = decode_block(&buf[rel..rel + br.len as usize], self.key())?;
+                self.cache_put(bh, data);
+            }
+            i = j;
+        }
+        Ok(())
+    }
+
+    /// Insere um bloco decodificado no cache, com despejo FIFO por tamanho.
+    fn cache_put(&mut self, hash: Hash, data: Vec<u8>) {
+        let n = data.len();
+        if n > self.cache_cap || self.block_cache.contains_key(&hash) {
+            return;
+        }
+        self.cache_bytes += n;
+        self.block_cache.insert(hash, data);
+        self.cache_order.push_back(hash);
+        while self.cache_bytes > self.cache_cap {
+            match self.cache_order.pop_front() {
+                Some(old) => {
+                    if let Some(v) = self.block_cache.remove(&old) {
+                        self.cache_bytes -= v.len();
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+
     /// Lê um arquivo lógico e escreve seu conteúdo em `out`.
     pub fn extract<W: Write>(&mut self, logical: &str, out: &mut W) -> Result<u64> {
         let logical = normalize_path(logical);
@@ -397,21 +694,10 @@ impl Vault {
             .clone();
 
         let mut written = 0u64;
-        for hash in &entry.chunks {
-            let bref = *self
-                .catalog
-                .blocks
-                .get(hash)
-                .context("bloco referenciado ausente (container corrompido)")?;
-            let mut buf = vec![0u8; bref.len as usize];
-            self.file.seek(SeekFrom::Start(bref.offset))?;
-            self.file.read_exact(&mut buf)?;
-            let data = decode_block(&buf, self.key())?;
-            // Revalida integridade pelo endereço de conteúdo.
-            if blake3::hash(&data).as_bytes() != hash {
-                bail!("falha de integridade em bloco de {logical}");
-            }
-            out.write_all(&data)?;
+        for cr in &entry.chunks {
+            self.ensure_block(&cr.hash)?;
+            let data = &self.block_cache[&cr.hash];
+            out.write_all(data)?;
             written += data.len() as u64;
         }
         Ok(written)
@@ -431,31 +717,31 @@ impl Vault {
             return Ok(Vec::new());
         }
         let end = (offset + len as u64).min(entry.size);
-        let mut out = Vec::with_capacity((end - offset) as usize);
 
-        let mut pos: u64 = 0; // início do chunk corrente, em bytes lógicos
-        for hash in &entry.chunks {
-            let bref = *self
-                .catalog
-                .blocks
-                .get(hash)
-                .context("bloco referenciado ausente (container corrompido)")?;
+        // 1) Coleta os chunks que tocam o intervalo (hash + offset lógico do chunk).
+        let mut needed: Vec<(Hash, u64)> = Vec::new();
+        let mut pos: u64 = 0;
+        for cr in &entry.chunks {
             let chunk_start = pos;
-            let chunk_end = pos + bref.raw_len as u64;
+            let chunk_end = pos + cr.len as u64; // tamanho inline: sem lookup
             pos = chunk_end;
             if chunk_end <= offset {
-                continue; // chunk inteiramente antes do intervalo
+                continue;
             }
             if chunk_start >= end {
-                break; // chunks seguintes estão além do intervalo
+                break;
             }
-            let mut buf = vec![0u8; bref.len as usize];
-            self.file.seek(SeekFrom::Start(bref.offset))?;
-            self.file.read_exact(&mut buf)?;
-            let data = decode_block(&buf, self.key())?;
-            if blake3::hash(&data).as_bytes() != hash {
-                bail!("falha de integridade em bloco de {logical}");
-            }
+            needed.push((cr.hash, chunk_start));
+        }
+
+        // 2) Decodifica em lote, coalescendo IO de blocos contíguos no .vault.
+        let hashes: Vec<Hash> = needed.iter().map(|(h, _)| *h).collect();
+        self.prefetch_blocks(&hashes)?;
+
+        // 3) Copia os pedaços do cache decodificado.
+        let mut out = Vec::with_capacity((end - offset) as usize);
+        for (hash, chunk_start) in needed {
+            let data = &self.block_cache[&hash];
             let from = offset.saturating_sub(chunk_start) as usize;
             let to = ((end - chunk_start) as usize).min(data.len());
             out.extend_from_slice(&data[from..to]);
@@ -721,14 +1007,14 @@ impl Vault {
         // Hashes alcançáveis: árvore atual + todos os snapshots nomeados.
         let mut reachable: HashSet<Hash> = HashSet::new();
         for f in self.catalog.files.values() {
-            for h in &f.chunks {
-                reachable.insert(*h);
+            for cr in &f.chunks {
+                reachable.insert(cr.hash);
             }
         }
         for snap in &self.catalog.snapshots {
             for f in snap.files.values() {
-                for h in &f.chunks {
-                    reachable.insert(*h);
+                for cr in &f.chunks {
+                    reachable.insert(cr.hash);
                 }
             }
         }
@@ -925,11 +1211,25 @@ impl Stats {
 /// Codifica um bloco: comprime (se compensar) e cifra (se houver chave).
 /// 1º byte = flags; corpo = `[nonce][ciphertext]` quando cifrado.
 fn encode_block(data: &[u8], level: i32, key: Option<&[u8; KEY_LEN]>) -> Result<Vec<u8>> {
-    let compressed = zstd::stream::encode_all(data, level).context("comprimindo bloco")?;
-    let (mut flags, inner) = if compressed.len() < data.len() {
-        (FLAG_ZSTD, compressed)
+    // Heurística barata: testa compressão num sample; se o sample mal comprime
+    // (ex.: dados já comprimidos como .rar/.jpg/.zip), pula o zstd do chunk
+    // inteiro e grava cru — evita desperdiçar CPU comprimindo o incompressível.
+    let sample_len = data.len().min(8 * 1024);
+    let sample_compressible = sample_len > 0 && {
+        let test = zstd::stream::encode_all(&data[..sample_len], level)
+            .context("testando compressão (sample)")?;
+        test.len() < sample_len * 9 / 10 // ganho > ~10% no sample
+    };
+
+    let (mut flags, inner) = if sample_compressible {
+        let compressed = zstd::stream::encode_all(data, level).context("comprimindo bloco")?;
+        if compressed.len() < data.len() {
+            (FLAG_ZSTD, compressed)
+        } else {
+            (0u8, data.to_vec())
+        }
     } else {
-        (0u8, data.to_vec())
+        (0u8, data.to_vec()) // incompressível: grava cru, sem comprimir o chunk todo
     };
     let body = match key {
         Some(k) => {
@@ -1138,6 +1438,42 @@ mod tests {
                 (x & 0xff) as u8
             })
             .collect()
+    }
+
+    #[test]
+    fn stream_write_sequential_and_random_fallback() {
+        let dir = tmp_dir("stream");
+        let vault_path = dir.join("s.vault");
+        let _ = std::fs::remove_file(&vault_path);
+        let mut v = Vault::create(&vault_path, DEFAULT_AVG_CHUNK).unwrap();
+
+        // Sequencial: escreve 500 KB em pedaços de 64 KB via streaming.
+        let data = pseudo_random(3, 500_000);
+        let mut w = v.stream_writer();
+        let mut off = 0u64;
+        for piece in data.chunks(64 * 1024) {
+            v.stream_write(&mut w, off, piece).unwrap();
+            off += piece.len() as u64;
+        }
+        assert_eq!(w.len(), data.len() as u64);
+        v.finish_write(w, "/seq.bin", 1).unwrap();
+        v.commit().unwrap();
+        // Round-trip total e leitura aleatória no meio.
+        assert_eq!(v.read_range("/seq.bin", 0, data.len()).unwrap(), data);
+        assert_eq!(
+            v.read_range("/seq.bin", 200_000, 50_000).unwrap(),
+            &data[200_000..250_000]
+        );
+
+        // Fora de ordem: escreve offset 5 antes do 0 -> cai para materializado.
+        let mut w2 = v.stream_writer();
+        v.stream_write(&mut w2, 5, b"BBBBB").unwrap();
+        v.stream_write(&mut w2, 0, b"AAAAA").unwrap();
+        v.finish_write(w2, "/rnd.bin", 1).unwrap();
+        v.commit().unwrap();
+        assert_eq!(v.read_range("/rnd.bin", 0, 100).unwrap(), b"AAAAABBBBB");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

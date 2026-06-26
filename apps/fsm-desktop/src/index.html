@@ -40,6 +40,7 @@
 
       <div class="actions">
         <button id="btnAdd" class="primary">➕ Adicionar arquivos</button>
+        <button id="btnMount">🔌 Montar como drive</button>
         <button id="btnGc">🧹 Compactar (gc)</button>
         <button id="btnClose" class="ghost">✕ Fechar</button>
       </div>
@@ -70,6 +71,21 @@
       </div>
       <p id="workError" class="error"></p>
     </main>
+
+    <!-- Tela de drive montado -->
+    <section id="mounted" class="welcome hidden">
+      <div class="card">
+        <h2>🔌 Cofre montado como drive</h2>
+        <p>Montado em <b id="mountAt"></b>.</p>
+        <p class="sub">
+          Edite os arquivos pelo gerenciador de arquivos do sistema (Explorer,
+          Files, etc.). O app fechou o cofre para evitar conflito de escrita —
+          desmonte para voltar a usá-lo aqui.
+        </p>
+        <button id="btnUnmount" class="primary">⏏ Desmontar</button>
+        <p id="mountError" class="error"></p>
+      </div>
+    </section>
 
     <div id="toast" class="toast hidden"></div>
 
