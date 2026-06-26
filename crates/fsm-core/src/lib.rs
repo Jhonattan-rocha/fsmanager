@@ -46,7 +46,7 @@ pub const HEADER_SIZE: u64 = 4096;
 /// Tamanho de chunk padrão (1 MiB). Arquivos são fatiados nesse tamanho.
 pub const DEFAULT_CHUNK: u32 = 1 << 20;
 /// Versão do formato on-disk.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 /// Nível de compressão zstd padrão (1..=22; 3 é o equilíbrio do zstd).
 pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
@@ -87,13 +87,28 @@ pub struct FileEntry {
     pub chunks: Vec<Hash>,
 }
 
-/// O índice persistido: mapa de dedup + tabela de arquivos.
+/// Uma versão nomeada da árvore de arquivos num instante.
+///
+/// É barato: guarda só os metadados (`files`); os dados continuam compartilhados
+/// no índice `blocks` por endereço de conteúdo. Enquanto existir, mantém seus
+/// blocos vivos para o `gc`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub name: String,
+    /// Unix timestamp (segundos) de criação.
+    pub created: i64,
+    pub files: BTreeMap<String, FileEntry>,
+}
+
+/// O índice persistido: mapa de dedup + tabela de arquivos + snapshots.
 #[derive(Default, Serialize, Deserialize)]
 pub struct Catalog {
     /// Índice de deduplicação: conteúdo -> localização física.
     pub blocks: HashMap<Hash, BlockRef>,
-    /// Caminho lógico (estilo unix, "/foo/bar.txt") -> metadados.
+    /// Caminho lógico (estilo unix, "/foo/bar.txt") -> metadados (árvore atual).
     pub files: BTreeMap<String, FileEntry>,
+    /// Versões nomeadas (point-in-time) da árvore.
+    pub snapshots: Vec<Snapshot>,
 }
 
 /// Estado de criptografia de um container aberto (presente só se tem senha).
@@ -403,6 +418,48 @@ impl Vault {
         Ok(())
     }
 
+    /// Cria um snapshot nomeado da árvore atual.
+    pub fn snapshot_create(&mut self, name: &str) -> Result<()> {
+        if name.trim().is_empty() {
+            bail!("nome de snapshot vazio");
+        }
+        if self.catalog.snapshots.iter().any(|s| s.name == name) {
+            bail!("snapshot já existe: {name}");
+        }
+        self.catalog.snapshots.push(Snapshot {
+            name: name.to_string(),
+            created: now_unix(),
+            files: self.catalog.files.clone(),
+        });
+        Ok(())
+    }
+
+    /// Snapshots existentes (mais antigo → mais recente).
+    pub fn snapshots(&self) -> &[Snapshot] {
+        &self.catalog.snapshots
+    }
+
+    /// Substitui a árvore de arquivos atual pelo conteúdo de um snapshot.
+    /// Os dados continuam disponíveis pois o snapshot mantinha os blocos vivos.
+    pub fn snapshot_restore(&mut self, name: &str) -> Result<()> {
+        let snap = self
+            .catalog
+            .snapshots
+            .iter()
+            .find(|s| s.name == name)
+            .with_context(|| format!("snapshot não encontrado: {name}"))?;
+        self.catalog.files = snap.files.clone();
+        Ok(())
+    }
+
+    /// Apaga um snapshot. Retorna `true` se existia. Os blocos exclusivos dele
+    /// só voltam ao espaço livre no próximo `gc`.
+    pub fn snapshot_delete(&mut self, name: &str) -> Result<bool> {
+        let before = self.catalog.snapshots.len();
+        self.catalog.snapshots.retain(|s| s.name != name);
+        Ok(self.catalog.snapshots.len() != before)
+    }
+
     /// Reescreve o container em `dest` mantendo só os blocos alcançáveis pelos
     /// arquivos atuais — recupera espaço de removidos e de gerações antigas.
     /// Preserva a criptografia (mesma chave/salt) para a mesma senha continuar valendo.
@@ -414,11 +471,18 @@ impl Vault {
         let bytes_before = self.file.metadata()?.len();
         let blocks_before = self.catalog.blocks.len();
 
-        // Conjunto de hashes realmente referenciados pelos arquivos atuais.
+        // Hashes alcançáveis: árvore atual + todos os snapshots nomeados.
         let mut reachable: HashSet<Hash> = HashSet::new();
         for f in self.catalog.files.values() {
             for h in &f.chunks {
                 reachable.insert(*h);
+            }
+        }
+        for snap in &self.catalog.snapshots {
+            for f in snap.files.values() {
+                for h in &f.chunks {
+                    reachable.insert(*h);
+                }
             }
         }
 
@@ -456,6 +520,7 @@ impl Vault {
         let new_catalog = Catalog {
             blocks: new_blocks,
             files: self.catalog.files.clone(),
+            snapshots: self.catalog.snapshots.clone(),
         };
         let raw = bincode::serialize(&new_catalog).context("serializando catálogo")?;
         let bytes = match &self.enc {
@@ -515,6 +580,7 @@ impl Vault {
             unique_raw_bytes: unique_raw,
             physical_bytes: physical,
             encrypted: self.enc.is_some(),
+            snapshots: self.catalog.snapshots.len(),
         }
     }
 }
@@ -530,6 +596,7 @@ pub struct Stats {
     /// Bytes realmente ocupados no disco (após dedup e compressão).
     pub physical_bytes: u64,
     pub encrypted: bool,
+    pub snapshots: usize,
 }
 
 /// Resultado de uma compactação ([`Vault::compact_to`]).
@@ -678,6 +745,14 @@ fn unseal(key: &[u8; KEY_LEN], data: &[u8]) -> Result<Vec<u8>> {
 
 // ----------------------- utilidades -----------------------
 
+/// Tempo atual em segundos desde a época Unix (0 se o relógio estiver antes dela).
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Lê até encher `buf` (ou EOF). Retorna bytes lidos.
 fn read_full(f: &mut File, buf: &mut [u8]) -> Result<usize> {
     let mut filled = 0;
@@ -789,6 +864,47 @@ mod tests {
         let mut out = Cursor::new(Vec::new());
         v2.extract("/docs/keep.bin", &mut out).unwrap();
         assert_eq!(out.into_inner(), std::fs::read(&keep).unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_restore_and_gc_preserves_history() {
+        let dir = tmp_dir("snap");
+        let vault_path = dir.join("s.vault");
+        let compact_path = dir.join("s2.vault");
+        let _ = std::fs::remove_file(&vault_path);
+        let _ = std::fs::remove_file(&compact_path);
+
+        let f = dir.join("doc.txt");
+        std::fs::write(&f, b"versao um do documento").unwrap();
+
+        let mut v = Vault::create(&vault_path, 64).unwrap();
+        v.add_file(&f, "doc.txt").unwrap();
+        v.snapshot_create("v1").unwrap();
+
+        // Sobrescreve o arquivo com novo conteúdo.
+        std::fs::write(&f, b"versao DOIS bem diferente do documento").unwrap();
+        v.add_file(&f, "doc.txt").unwrap();
+        v.commit().unwrap();
+
+        assert_eq!(v.snapshots().len(), 1);
+
+        // Restaura para v1 e confirma o conteúdo antigo.
+        v.snapshot_restore("v1").unwrap();
+        v.commit().unwrap();
+        let mut out = Cursor::new(Vec::new());
+        v.extract("doc.txt", &mut out).unwrap();
+        assert_eq!(out.into_inner(), b"versao um do documento");
+
+        // gc deve preservar os blocos do snapshot v1 (história intacta).
+        let mut v2 = Vault::open(&vault_path, None).unwrap();
+        v2.compact_to(&compact_path).unwrap();
+        let mut v3 = Vault::open(&compact_path, None).unwrap();
+        assert_eq!(v3.snapshots().len(), 1);
+        let mut out = Cursor::new(Vec::new());
+        v3.extract("doc.txt", &mut out).unwrap();
+        assert_eq!(out.into_inner(), b"versao um do documento");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

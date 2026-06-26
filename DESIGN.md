@@ -53,14 +53,17 @@ uma geração — semente do versionamento.
 - [x] Semântica de FS: `rm` (arquivo) e `rm -r` (diretório/prefixo), `mv`
       (arquivo ou subárvore), `ls <prefixo>`, e `gc` (compact_to) que reescreve
       o container só com blocos alcançáveis — recupera removidos e gerações antigas.
+- [x] Snapshots: `snapshot create/list/restore/delete`. Cada snapshot guarda só
+      a árvore de metadados (dados compartilhados via content-addressing) e mantém
+      seus blocos vivos. O `gc` calcula alcançabilidade sobre a árvore atual + todos
+      os snapshots, então NÃO destrói histórico nomeado. Formato v4.
 
 ## Roadmap
 1. **v0** motor + CLI com dedup. ✅
 2. Pipeline: compressão zstd por bloco. ✅
 3. Pipeline: criptografia XChaCha20-Poly1305 + KDF Argon2 (senha → chave-mestra). ✅
 4. Semântica de FS: `rm`/`mv`/`ls <prefixo>`/`gc`. ✅
-5. Snapshots: comando para nomear/listar/restaurar gerações (o append-only já
-   preserva gerações; falta interface e impedir que o `gc` descarte as nomeadas).
+5. Snapshots: `create/list/restore/delete`, com `gc` respeitando os nomeados. ✅
 6. Chunking por conteúdo (CDC/FastCDC) para melhor dedup em arquivos editados.
 7. UI (Tauri) — explorador visual (Opção A).
 8. Montagem como drive (WinFsp/FUSE) — o diferencial matador (Opção B).

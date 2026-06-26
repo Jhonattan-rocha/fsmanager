@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::time::{Duration, UNIX_EPOCH};
 use fsm_core::{Vault, DEFAULT_CHUNK};
 
 #[derive(Parser)]
@@ -95,6 +96,26 @@ enum Cmd {
         #[arg(long, short = 'p')]
         password: Option<String>,
     },
+    /// Gerencia snapshots (versões nomeadas da árvore).
+    Snapshot {
+        vault: PathBuf,
+        #[arg(long, short = 'p')]
+        password: Option<String>,
+        #[command(subcommand)]
+        action: SnapAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SnapAction {
+    /// Cria um snapshot da árvore atual.
+    Create { name: String },
+    /// Lista os snapshots existentes.
+    List,
+    /// Restaura a árvore atual para um snapshot.
+    Restore { name: String },
+    /// Apaga um snapshot (espaço volta no próximo gc).
+    Delete { name: String },
 }
 
 /// Resolve a senha: flag explícita ou variável de ambiente FSM_PASSWORD.
@@ -243,6 +264,7 @@ fn main() -> Result<()> {
             let s = v.stats();
             println!("arquivos:           {}", s.files);
             println!("blocos únicos:      {}", s.unique_blocks);
+            println!("snapshots:          {}", s.snapshots);
             println!("cifrado:            {}", if s.encrypted { "sim" } else { "não" });
             println!("tamanho lógico:     {} bytes", s.logical_bytes);
             println!("após dedup:         {} bytes", s.unique_raw_bytes);
@@ -251,6 +273,73 @@ fn main() -> Result<()> {
             println!("economia compressão:{:.1}%", s.compression_savings() * 100.0);
             println!("economia total:     {:.1}%", s.total_savings() * 100.0);
         }
+        Cmd::Snapshot {
+            vault,
+            password,
+            action,
+        } => {
+            let pw = resolve_pw(password);
+            let mut v = Vault::open(&vault, pw.as_deref())?;
+            match action {
+                SnapAction::Create { name } => {
+                    v.snapshot_create(&name)?;
+                    v.commit()?;
+                    println!("snapshot criado: {name}");
+                }
+                SnapAction::List => {
+                    if v.snapshots().is_empty() {
+                        println!("(nenhum snapshot)");
+                    }
+                    for s in v.snapshots() {
+                        let total: u64 = s.files.values().map(|f| f.size).sum();
+                        println!(
+                            "{:<20} {:>4} arquivo(s)  {:>12} bytes  {}",
+                            s.name,
+                            s.files.len(),
+                            total,
+                            fmt_time(s.created)
+                        );
+                    }
+                }
+                SnapAction::Restore { name } => {
+                    v.snapshot_restore(&name)?;
+                    v.commit()?;
+                    println!("árvore restaurada para o snapshot: {name}");
+                }
+                SnapAction::Delete { name } => {
+                    if v.snapshot_delete(&name)? {
+                        v.commit()?;
+                        println!("snapshot apagado: {name} (rode 'gc' para liberar espaço)");
+                    } else {
+                        anyhow::bail!("snapshot não encontrado: {name}");
+                    }
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Formata um unix timestamp (UTC) como `AAAA-MM-DD HH:MM:SS` sem dependências.
+fn fmt_time(secs: i64) -> String {
+    if secs <= 0 {
+        return "-".into();
+    }
+    let st = UNIX_EPOCH + Duration::from_secs(secs as u64);
+    let total = secs as u64;
+    let (s, m, h) = (total % 60, total / 60 % 60, total / 3600 % 24);
+    let days = (total / 86_400) as i64;
+    // Algoritmo civil de Howard Hinnant (days desde a época -> data).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    let _ = st;
+    format!("{year:04}-{month:02}-{d:02} {h:02}:{m:02}:{s:02} UTC")
 }
