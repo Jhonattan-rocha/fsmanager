@@ -28,7 +28,7 @@
 //! Dedup acontece *dentro* do container sob a chave-mestra única — evitando os
 //! ataques de confirmação da *convergent encryption*.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -49,7 +49,7 @@ pub const HEADER_SIZE: u64 = 4096;
 /// os blocos seguintes, então o dedup sobrevive a inserções/edições.
 pub const DEFAULT_AVG_CHUNK: u32 = 64 * 1024;
 /// Versão do formato on-disk.
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 /// Nível de compressão zstd padrão (1..=22; 3 é o equilíbrio do zstd).
 pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
@@ -101,6 +101,9 @@ pub struct Snapshot {
     /// Unix timestamp (segundos) de criação.
     pub created: i64,
     pub files: BTreeMap<String, FileEntry>,
+    /// Diretórios explícitos (vazios) no instante do snapshot.
+    #[serde(default)]
+    pub dirs: BTreeSet<String>,
 }
 
 /// O índice persistido: mapa de dedup + tabela de arquivos + snapshots.
@@ -112,6 +115,10 @@ pub struct Catalog {
     pub files: BTreeMap<String, FileEntry>,
     /// Versões nomeadas (point-in-time) da árvore.
     pub snapshots: Vec<Snapshot>,
+    /// Diretórios explícitos (criados vazios via mount). Diretórios derivados
+    /// de caminhos de arquivos continuam implícitos.
+    #[serde(default)]
+    pub dirs: BTreeSet<String>,
 }
 
 /// Estado de criptografia de um container aberto (presente só se tem senha).
@@ -310,6 +317,53 @@ impl Vault {
         Ok(())
     }
 
+    /// Grava (ou substitui) um arquivo lógico a partir de um buffer completo em
+    /// memória. Re-chunka com FastCDC (dedup aplica) e atualiza o catálogo.
+    /// Base da montagem read-write: o handle materializa o arquivo, edita, e no
+    /// flush chama aqui.
+    pub fn write_file(&mut self, logical: &str, data: &[u8], mtime: i64) -> Result<()> {
+        let (min, avg, max) = cdc_params(self.chunk_size);
+        let mut chunks = Vec::new();
+        if !data.is_empty() {
+            for chunk in fastcdc::v2020::FastCDC::new(data, min, avg, max) {
+                let slice = &data[chunk.offset..chunk.offset + chunk.length];
+                chunks.push(self.write_block(slice)?);
+            }
+        }
+        let dest = normalize_path(logical);
+        self.catalog.dirs.remove(&dest); // não pode ser dir e arquivo
+        self.catalog.files.insert(
+            dest,
+            FileEntry {
+                size: data.len() as u64,
+                mtime,
+                chunks,
+            },
+        );
+        Ok(())
+    }
+
+    /// Cria um diretório explícito (vazio). Diretórios derivados de arquivos
+    /// continuam implícitos e não precisam disto.
+    pub fn create_dir(&mut self, logical: &str) -> Result<()> {
+        let p = normalize_path(logical);
+        if p == "/" {
+            return Ok(());
+        }
+        if self.catalog.files.contains_key(&p) {
+            bail!("já existe um arquivo em {p}");
+        }
+        self.catalog.dirs.insert(p);
+        Ok(())
+    }
+
+    /// Remove um diretório explícito do catálogo (rmdir). Retorna `true` se existia.
+    /// A verificação de "vazio" cabe à camada de montagem.
+    pub fn remove_empty_dir(&mut self, logical: &str) -> Result<bool> {
+        let p = normalize_path(logical);
+        Ok(self.catalog.dirs.remove(&p))
+    }
+
     /// Grava um bloco (deduplicando). Retorna o hash de conteúdo.
     fn write_block(&mut self, data: &[u8]) -> Result<Hash> {
         let hash = *blake3::hash(data).as_bytes();
@@ -421,9 +475,54 @@ impl Vault {
                 mtime: e.mtime,
             });
         }
-        let pre = format!("{p}/");
-        if self.catalog.files.keys().any(|k| k.starts_with(&pre)) {
+        if self.catalog.dirs.contains(&p) {
             return Some(NodeKind::Dir);
+        }
+        let pre = format!("{p}/");
+        if self.catalog.files.keys().any(|k| k.starts_with(&pre))
+            || self.catalog.dirs.iter().any(|k| k.starts_with(&pre))
+        {
+            return Some(NodeKind::Dir);
+        }
+        None
+    }
+
+    /// Como [`resolve`](Self::resolve), mas case-insensitive (ASCII). Retorna o
+    /// caminho REAL (com a grafia do catálogo) além do tipo. Necessário no mount
+    /// Windows, onde o WinFsp consulta nomes em maiúsculas em volumes
+    /// case-insensitive.
+    pub fn resolve_ci(&self, path: &str) -> Option<(String, NodeKind)> {
+        let q = normalize_path(path);
+        if q == "/" {
+            return Some(("/".to_string(), NodeKind::Dir));
+        }
+        // Caminho rápido: correspondência exata.
+        if let Some(e) = self.catalog.files.get(&q) {
+            return Some((q, NodeKind::File { size: e.size, mtime: e.mtime }));
+        }
+        if self.catalog.dirs.contains(&q) {
+            return Some((q, NodeKind::Dir));
+        }
+        // Arquivo, ignorando caixa.
+        for (k, e) in &self.catalog.files {
+            if k.eq_ignore_ascii_case(&q) {
+                return Some((k.clone(), NodeKind::File { size: e.size, mtime: e.mtime }));
+            }
+        }
+        // Diretório explícito, ignorando caixa.
+        for d in &self.catalog.dirs {
+            if d.eq_ignore_ascii_case(&q) {
+                return Some((d.clone(), NodeKind::Dir));
+            }
+        }
+        // Diretório implícito (prefixo de algum caminho), ignorando caixa.
+        for k in self.catalog.files.keys().chain(self.catalog.dirs.iter()) {
+            if k.len() > q.len()
+                && k.as_bytes()[q.len()] == b'/'
+                && k[..q.len()].eq_ignore_ascii_case(&q)
+            {
+                return Some((k[..q.len()].to_string(), NodeKind::Dir));
+            }
         }
         None
     }
@@ -433,7 +532,7 @@ impl Vault {
     pub fn list_dir(&self, path: &str) -> Vec<DirEntry> {
         let p = normalize_path(path);
         let pre = if p == "/" { "/".to_string() } else { format!("{p}/") };
-        let mut subdirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut subdirs: BTreeSet<String> = BTreeSet::new();
         let mut entries: Vec<DirEntry> = Vec::new();
         for (k, e) in &self.catalog.files {
             if !k.starts_with(&pre) {
@@ -454,6 +553,21 @@ impl Vault {
                     subdirs.insert(rest[..i].to_string());
                 }
             }
+        }
+        // Diretórios explícitos: filhos imediatos e ancestrais sob o prefixo.
+        for d in &self.catalog.dirs {
+            if !d.starts_with(&pre) {
+                continue;
+            }
+            let rest = &d[pre.len()..];
+            if rest.is_empty() {
+                continue;
+            }
+            let name = match rest.find('/') {
+                None => rest,
+                Some(i) => &rest[..i],
+            };
+            subdirs.insert(name.to_string());
         }
         for d in subdirs {
             entries.push(DirEntry {
@@ -488,6 +602,9 @@ impl Vault {
         for k in &victims {
             self.catalog.files.remove(k);
         }
+        self.catalog
+            .dirs
+            .retain(|d| !(*d == base || d.starts_with(&pre)));
         Ok(victims.len())
     }
 
@@ -498,28 +615,50 @@ impl Vault {
 
         // Caso 1: arquivo exato.
         if let Some(entry) = self.catalog.files.remove(&src) {
+            self.catalog.dirs.remove(&dst);
             self.catalog.files.insert(dst, entry);
             return Ok(());
         }
 
-        // Caso 2: diretório (prefixo).
-        let pre = format!("{}/", src.trim_end_matches('/'));
-        let moves: Vec<String> = self
+        // Caso 2: diretório (explícito e/ou prefixo de arquivos/dirs).
+        let pre = format!("{src}/");
+        let is_dir = self.catalog.dirs.contains(&src)
+            || self.catalog.files.keys().any(|k| k.starts_with(&pre))
+            || self.catalog.dirs.iter().any(|k| k.starts_with(&pre));
+        if !is_dir {
+            bail!("origem não encontrada: {src}");
+        }
+        let dst_base = dst.trim_end_matches('/').to_string();
+
+        // Move arquivos sob o prefixo.
+        let file_moves: Vec<String> = self
             .catalog
             .files
             .keys()
             .filter(|k| k.starts_with(&pre))
             .cloned()
             .collect();
-        if moves.is_empty() {
-            bail!("origem não encontrada: {src}");
-        }
-        let dst_base = dst.trim_end_matches('/').to_string();
-        for old in moves {
+        for old in file_moves {
             let suffix = &old[pre.len()..];
-            let new = format!("{dst_base}/{suffix}");
             let entry = self.catalog.files.remove(&old).unwrap();
-            self.catalog.files.insert(new, entry);
+            self.catalog.files.insert(format!("{dst_base}/{suffix}"), entry);
+        }
+        // Move diretórios explícitos: o próprio src e os sob src/.
+        let dir_moves: Vec<String> = self
+            .catalog
+            .dirs
+            .iter()
+            .filter(|d| **d == src || d.starts_with(&pre))
+            .cloned()
+            .collect();
+        for old in dir_moves {
+            self.catalog.dirs.remove(&old);
+            let new = if old == src {
+                dst.clone()
+            } else {
+                format!("{dst_base}/{}", &old[pre.len()..])
+            };
+            self.catalog.dirs.insert(new);
         }
         Ok(())
     }
@@ -536,6 +675,7 @@ impl Vault {
             name: name.to_string(),
             created: now_unix(),
             files: self.catalog.files.clone(),
+            dirs: self.catalog.dirs.clone(),
         });
         Ok(())
     }
@@ -555,6 +695,7 @@ impl Vault {
             .find(|s| s.name == name)
             .with_context(|| format!("snapshot não encontrado: {name}"))?;
         self.catalog.files = snap.files.clone();
+        self.catalog.dirs = snap.dirs.clone();
         Ok(())
     }
 
@@ -627,6 +768,7 @@ impl Vault {
             blocks: new_blocks,
             files: self.catalog.files.clone(),
             snapshots: self.catalog.snapshots.clone(),
+            dirs: self.catalog.dirs.clone(),
         };
         let raw = bincode::serialize(&new_catalog).context("serializando catálogo")?;
         let bytes = match &self.enc {
@@ -996,6 +1138,87 @@ mod tests {
                 (x & 0xff) as u8
             })
             .collect()
+    }
+
+    #[test]
+    fn write_file_overwrite_and_explicit_dirs() {
+        let dir = tmp_dir("rw");
+        let vault_path = dir.join("rw.vault");
+        let _ = std::fs::remove_file(&vault_path);
+
+        let mut v = Vault::create(&vault_path, DEFAULT_AVG_CHUNK).unwrap();
+
+        // Diretório vazio explícito (mkdir).
+        v.create_dir("/novo").unwrap();
+        assert!(matches!(v.resolve("/novo"), Some(NodeKind::Dir)));
+
+        // Escreve um arquivo dentro dele a partir de um buffer.
+        v.write_file("/novo/a.txt", b"primeira versao", 100).unwrap();
+        v.commit().unwrap();
+        assert_eq!(
+            v.read_range("/novo/a.txt", 0, 4096).unwrap(),
+            b"primeira versao"
+        );
+
+        // Sobrescreve (simula edição aleatória: buffer inteiro novo).
+        v.write_file("/novo/a.txt", b"segunda versao, bem maior que a primeira", 200)
+            .unwrap();
+        v.commit().unwrap();
+        assert_eq!(
+            v.read_range("/novo/a.txt", 0, 4096).unwrap(),
+            b"segunda versao, bem maior que a primeira"
+        );
+        assert!(matches!(
+            v.resolve("/novo/a.txt"),
+            Some(NodeKind::File { size: 40, .. })
+        ));
+
+        // Listagens veem o dir e o arquivo.
+        assert!(v.list_dir("/").iter().any(|e| e.name == "novo" && e.is_dir));
+        assert!(v
+            .list_dir("/novo")
+            .iter()
+            .any(|e| e.name == "a.txt" && !e.is_dir));
+
+        // Reabre: o diretório vazio explícito e o arquivo persistem.
+        drop(v);
+        let v2 = Vault::open(&vault_path, None).unwrap();
+        assert!(matches!(v2.resolve("/novo"), Some(NodeKind::Dir)));
+        assert!(matches!(v2.resolve("/novo/a.txt"), Some(NodeKind::File { .. })));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_ci_is_case_insensitive() {
+        let dir = tmp_dir("ci");
+        let vault_path = dir.join("ci.vault");
+        let _ = std::fs::remove_file(&vault_path);
+
+        let mut v = Vault::create(&vault_path, DEFAULT_AVG_CHUNK).unwrap();
+        v.create_dir("/Docs").unwrap();
+        v.write_file("/Docs/Arquivo.TXT", b"x", 1).unwrap();
+        v.commit().unwrap();
+
+        // Caixa diferente resolve para o caminho REAL.
+        let (real, kind) = v.resolve_ci("/docs/arquivo.txt").unwrap();
+        assert_eq!(real, "/Docs/Arquivo.TXT");
+        assert!(matches!(kind, NodeKind::File { .. }));
+
+        // Diretório explícito, caixa diferente.
+        let (real, kind) = v.resolve_ci("/DOCS").unwrap();
+        assert_eq!(real, "/Docs");
+        assert!(matches!(kind, NodeKind::Dir));
+
+        // Diretório implícito via prefixo, caixa diferente.
+        v.write_file("/Outro/sub/f.bin", b"y", 1).unwrap();
+        let (real, kind) = v.resolve_ci("/outro").unwrap();
+        assert_eq!(real, "/Outro");
+        assert!(matches!(kind, NodeKind::Dir));
+
+        assert!(v.resolve_ci("/naoexiste").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

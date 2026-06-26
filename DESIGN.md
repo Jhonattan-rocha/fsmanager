@@ -77,6 +77,16 @@ uma geração — semente do versionamento.
       `fuser` 0.17). Mapeia o catálogo para uma árvore de inodes; `read`→`read_range`,
       `readdir`→`list_dir`. ESCRITO contra a API real, mas NÃO compilado/testado
       (host é Windows) — pendente verificação numa máquina Linux.
+- [x] Mount Windows/WinFsp READ-WRITE. Modelo: cada handle materializa o arquivo
+      num buffer (`Vec<u8>`, lazy); write/truncate editam o buffer; em flush/cleanup,
+      se sujo, re-chunka (FastCDC+dedup) via `write_file` e commita. Implementa
+      create/write/overwrite/set_file_size/cleanup(delete)/set_delete/rename/flush.
+      Camada de escrita do core (`write_file`, `create_dir`, `remove_empty_dir`,
+      `resolve_ci`) + diretórios explícitos (formato v6). Validado: New-Item,
+      Set/Get/Add-Content, Copy-Item (hash bate), Rename-Item, delete, mkdir, e
+      PERSISTÊNCIA (reabrir o .vault). Funciona com Explorer/PowerShell/apps.
+      LIMITAÇÃO conhecida: builtins do cmd.exe (`copy`/`ren`/`del`) têm
+      idiossincrasia com WinFsp e falham; operações diretas (CreateFile) funcionam.
 
 ## Roadmap
 1. **v0** motor + CLI com dedup. ✅
@@ -86,9 +96,9 @@ uma geração — semente do versionamento.
 5. Snapshots: `create/list/restore/delete`, com `gc` respeitando os nomeados. ✅
 6. Chunking por conteúdo (FastCDC) para melhor dedup em arquivos editados. ✅
 7. UI (Tauri) — explorador visual (Opção A). ✅
-8. Montagem como drive: Windows/WinFsp read-only ✅; FUSE/Linux read-only ✅ (a
-   compilar/testar em Linux). Próximo: mount read-write (camada de escrita
-   aleatória: cache de blocos sujos + re-chunk no flush) e botão "Montar" na UI.
+8. Montagem como drive: Windows/WinFsp read-only ✅ e READ-WRITE ✅; FUSE/Linux
+   read-only ✅ (a testar em Linux). Próximo: FUSE read-write (espelhar o modelo
+   do Windows no `unix`) e botão "Montar" na UI (Tauri chamando o fsm-mount).
 
 ## Mount (crates/fsm-mount) — binário separado
 GPL-3.0 porque linka `winfsp` (GPLv3); por isso é um BINÁRIO À PARTE — `fsm-core`,
