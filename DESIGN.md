@@ -61,6 +61,12 @@ uma geração — semente do versionamento.
       conteúdo (gear hash), avg 64 KiB (min/max derivados). Dedup sobrevive a
       inserções/edições — inserir 137 bytes no início de 1 MiB gerou só 1 bloco
       novo (46% dedup) vs ~0% do chunking fixo. Só afeta escrita. Formato v5.
+- [x] UI desktop (Tauri v2, vanilla JS) em `apps/fsm-desktop`. Backend expõe o
+      `fsm-core` via comandos; mantém UM vault aberto em estado compartilhado
+      (reusa a chave Argon2). Diálogos nativos pelo lado Rust (plugin `dialog`),
+      sem bindings JS — funciona em Windows e Linux. Telas: abrir/criar cofre,
+      stats, lista de arquivos (extrair/remover), snapshots (criar/restaurar/
+      apagar), e gc.
 
 ## Roadmap
 1. **v0** motor + CLI com dedup. ✅
@@ -69,8 +75,19 @@ uma geração — semente do versionamento.
 4. Semântica de FS: `rm`/`mv`/`ls <prefixo>`/`gc`. ✅
 5. Snapshots: `create/list/restore/delete`, com `gc` respeitando os nomeados. ✅
 6. Chunking por conteúdo (FastCDC) para melhor dedup em arquivos editados. ✅
-7. UI (Tauri) — explorador visual (Opção A).
-8. Montagem como drive (WinFsp/FUSE) — o diferencial matador (Opção B).
+7. UI (Tauri) — explorador visual (Opção A). ✅
+8. Montagem como drive (WinFsp no Windows / FUSE no Linux) — diferencial matador.
+
+## App desktop (apps/fsm-desktop)
+Tauri v2 + frontend vanilla estático (`src/`, sem bundler — `withGlobalTauri`).
+- Rodar em dev:  `cd apps/fsm-desktop && npm install && npm run tauri dev`
+- Gerar binário: `npm run tauri build -- --no-bundle` (só o .exe, ~7 MB; pula o
+  download dos empacotadores WiX/NSIS). Sem `--no-bundle` gera o instalador.
+- `[profile.release]` em `src-tauri/Cargo.toml`: strip + opt-level="s" + lto.
+- Backend: `src-tauri/src/lib.rs` (comandos que envolvem o `fsm-core`).
+- Nota de ambiente: este host tem POUCO espaço em disco e o build debug do Tauri
+  estourava disco + limite de PDB do linker. Resolvido com `[profile.dev]
+  debug = false, strip = "debuginfo"` no `src-tauri/Cargo.toml`.
 
 ## Notas de segurança (pendências honestas)
 - `--password` na linha de comando fica visível na lista de processos / histórico
