@@ -72,7 +72,11 @@ uma geração — semente do versionamento.
       diretórios derivada dos caminhos planos).
 - [x] Mount como drive — Windows/WinFsp (somente leitura), crate `fsm-mount`.
       `.vault` vira `X:\`; qualquer app lê os arquivos transparentemente
-      (validado: dir/type/Get-FileHash batem com o original). FUSE/Linux: stub.
+      (validado: dir/type/Get-FileHash batem com o original).
+- [x] Mount FUSE/Linux (somente leitura) — módulo `unix` da `fsm-mount` (crate
+      `fuser` 0.17). Mapeia o catálogo para uma árvore de inodes; `read`→`read_range`,
+      `readdir`→`list_dir`. ESCRITO contra a API real, mas NÃO compilado/testado
+      (host é Windows) — pendente verificação numa máquina Linux.
 
 ## Roadmap
 1. **v0** motor + CLI com dedup. ✅
@@ -82,14 +86,18 @@ uma geração — semente do versionamento.
 5. Snapshots: `create/list/restore/delete`, com `gc` respeitando os nomeados. ✅
 6. Chunking por conteúdo (FastCDC) para melhor dedup em arquivos editados. ✅
 7. UI (Tauri) — explorador visual (Opção A). ✅
-8. Montagem como drive: Windows/WinFsp read-only ✅. Próximo: FUSE/Linux read-only,
-   depois read-write (camada de escrita aleatória: cache de blocos sujos + re-chunk
-   no flush).
+8. Montagem como drive: Windows/WinFsp read-only ✅; FUSE/Linux read-only ✅ (a
+   compilar/testar em Linux). Próximo: mount read-write (camada de escrita
+   aleatória: cache de blocos sujos + re-chunk no flush) e botão "Montar" na UI.
 
 ## Mount (crates/fsm-mount) — binário separado
 GPL-3.0 porque linka `winfsp` (GPLv3); por isso é um BINÁRIO À PARTE — `fsm-core`,
 `fsm-cli` e a UI continuam MIT/Apache. Fora do workspace (exclude).
-- Rodar: `fsm-mount <vault> X: [-p senha]`  (Ctrl+C desmonta)
+- Rodar (Windows): `fsm-mount <vault> X: [-p senha]`  (Ctrl+C desmonta)
+- Rodar (Linux):   `fsm-mount <vault> /mnt/fsm [-p senha]`  (Ctrl+C desmonta)
+- Build no Linux: requer `libfuse3-dev` (ou `fuse3`/`libfuse-dev`) + `pkg-config`,
+  e o módulo FUSE no kernel. Não precisa de libclang (sem winfsp). NÃO foi
+  compilado neste host Windows — validar em Linux.
 - Build no Windows exige libclang (bindgen do winfsp-sys). Existe no Visual Studio:
   `LIBCLANG_PATH="C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\Llvm\x64\bin"`
   (caminho específico desta máquina; ajustar conforme a instalação).

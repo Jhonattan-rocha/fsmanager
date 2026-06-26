@@ -1,4 +1,7 @@
 /target
 *.vault
 Cargo.lock
+*target
 fsm-mount/target
+fsm-cli/target
+fsm-core/target
