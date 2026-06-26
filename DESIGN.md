@@ -56,7 +56,11 @@ uma geração — semente do versionamento.
 - [x] Snapshots: `snapshot create/list/restore/delete`. Cada snapshot guarda só
       a árvore de metadados (dados compartilhados via content-addressing) e mantém
       seus blocos vivos. O `gc` calcula alcançabilidade sobre a árvore atual + todos
-      os snapshots, então NÃO destrói histórico nomeado. Formato v4.
+      os snapshots, então NÃO destrói histórico nomeado.
+- [x] Chunking por conteúdo (FastCDC v2020, crate `fastcdc`): fronteiras pelo
+      conteúdo (gear hash), avg 64 KiB (min/max derivados). Dedup sobrevive a
+      inserções/edições — inserir 137 bytes no início de 1 MiB gerou só 1 bloco
+      novo (46% dedup) vs ~0% do chunking fixo. Só afeta escrita. Formato v5.
 
 ## Roadmap
 1. **v0** motor + CLI com dedup. ✅
@@ -64,7 +68,7 @@ uma geração — semente do versionamento.
 3. Pipeline: criptografia XChaCha20-Poly1305 + KDF Argon2 (senha → chave-mestra). ✅
 4. Semântica de FS: `rm`/`mv`/`ls <prefixo>`/`gc`. ✅
 5. Snapshots: `create/list/restore/delete`, com `gc` respeitando os nomeados. ✅
-6. Chunking por conteúdo (CDC/FastCDC) para melhor dedup em arquivos editados.
+6. Chunking por conteúdo (FastCDC) para melhor dedup em arquivos editados. ✅
 7. UI (Tauri) — explorador visual (Opção A).
 8. Montagem como drive (WinFsp/FUSE) — o diferencial matador (Opção B).
 

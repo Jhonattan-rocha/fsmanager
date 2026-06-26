@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::time::{Duration, UNIX_EPOCH};
-use fsm_core::{Vault, DEFAULT_CHUNK};
+use fsm_core::{Vault, DEFAULT_AVG_CHUNK};
 
 #[derive(Parser)]
 #[command(name = "fsm", version, about = "Gerenciador de container virtual (arquivo único)")]
@@ -21,7 +21,7 @@ enum Cmd {
     Init {
         /// Caminho do container (ex: meu.vault)
         vault: PathBuf,
-        /// Tamanho de chunk em bytes (padrão: 1 MiB)
+        /// Tamanho médio de chunk do FastCDC em bytes (padrão: 64 KiB)
         #[arg(long)]
         chunk: Option<u32>,
         /// Cria um container CIFRADO com esta senha (ou via env FSM_PASSWORD).
@@ -131,7 +131,7 @@ fn main() -> Result<()> {
             chunk,
             password,
         } => {
-            let chunk = chunk.unwrap_or(DEFAULT_CHUNK);
+            let chunk = chunk.unwrap_or(DEFAULT_AVG_CHUNK);
             match resolve_pw(password) {
                 Some(pw) => {
                     Vault::create_encrypted(&vault, chunk, &pw)?;

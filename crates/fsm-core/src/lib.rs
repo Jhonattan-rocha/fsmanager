@@ -36,6 +36,7 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::{anyhow, bail, Context, Result};
 use chacha20poly1305::{aead::Aead, Key, KeyInit, XChaCha20Poly1305, XNonce};
+use fastcdc::v2020::StreamCDC;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
@@ -43,10 +44,12 @@ use serde::{Deserialize, Serialize};
 pub const MAGIC: &[u8; 8] = b"FSMVLT01";
 /// Tamanho fixo do header em bytes.
 pub const HEADER_SIZE: u64 = 4096;
-/// Tamanho de chunk padrão (1 MiB). Arquivos são fatiados nesse tamanho.
-pub const DEFAULT_CHUNK: u32 = 1 << 20;
+/// Tamanho médio de chunk alvo do FastCDC (64 KiB). Min/max são derivados dele.
+/// Fronteiras definidas pelo conteúdo: editar o meio de um arquivo não desloca
+/// os blocos seguintes, então o dedup sobrevive a inserções/edições.
+pub const DEFAULT_AVG_CHUNK: u32 = 64 * 1024;
 /// Versão do formato on-disk.
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 /// Nível de compressão zstd padrão (1..=22; 3 é o equilíbrio do zstd).
 pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
@@ -273,9 +276,8 @@ impl Vault {
     /// Os blocos são gravados na hora; o catálogo só é persistido em [`commit`].
     pub fn add_file(&mut self, src: impl AsRef<Path>, dest: &str) -> Result<()> {
         let src = src.as_ref();
-        let mut f =
-            File::open(src).with_context(|| format!("abrindo origem {}", src.display()))?;
-        let meta = f.metadata()?;
+        let meta = std::fs::metadata(src)
+            .with_context(|| format!("lendo metadados de {}", src.display()))?;
         let mtime = meta
             .modified()
             .ok()
@@ -283,16 +285,16 @@ impl Vault {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
+        let f = File::open(src).with_context(|| format!("abrindo origem {}", src.display()))?;
+        let (min, avg, max) = cdc_params(self.chunk_size);
+
         let mut chunks = Vec::new();
         let mut total: u64 = 0;
-        let mut buf = vec![0u8; self.chunk_size as usize];
-        loop {
-            let n = read_full(&mut f, &mut buf)?;
-            if n == 0 {
-                break;
-            }
-            total += n as u64;
-            let hash = self.write_block(&buf[..n])?;
+        // FastCDC: fronteiras definidas pelo conteúdo (rolling hash gear).
+        for item in StreamCDC::new(f, min, avg, max) {
+            let chunk = item.map_err(|e| anyhow!("fatiando {} (FastCDC): {e}", src.display()))?;
+            total += chunk.length as u64;
+            let hash = self.write_block(&chunk.data)?;
             chunks.push(hash);
         }
 
@@ -753,17 +755,14 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// Lê até encher `buf` (ou EOF). Retorna bytes lidos.
-fn read_full(f: &mut File, buf: &mut [u8]) -> Result<usize> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        let n = f.read(&mut buf[filled..])?;
-        if n == 0 {
-            break;
-        }
-        filled += n;
-    }
-    Ok(filled)
+/// Deriva `(min, avg, max)` válidos para o FastCDC a partir do alvo médio,
+/// respeitando os limites da crate (min≥64, avg≥256, max≤16 MiB).
+fn cdc_params(target_avg: u32) -> (u32, u32, u32) {
+    use fastcdc::v2020::{AVERAGE_MIN, MAXIMUM_MAX, MINIMUM_MIN};
+    let avg = target_avg.clamp(AVERAGE_MIN, MAXIMUM_MAX / 4);
+    let min = (avg / 4).max(MINIMUM_MIN);
+    let max = (avg.saturating_mul(4)).min(MAXIMUM_MAX);
+    (min, avg, max)
 }
 
 /// Normaliza caminho lógico: separadores `/`, prefixo `/`, sem `./` ou `\`.
@@ -864,6 +863,62 @@ mod tests {
         let mut out = Cursor::new(Vec::new());
         v2.extract("/docs/keep.bin", &mut out).unwrap();
         assert_eq!(out.into_inner(), std::fs::read(&keep).unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gera bytes pseudo-aleatórios determinísticos (incompressíveis).
+    fn pseudo_random(seed: u32, n: usize) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x & 0xff) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fastcdc_dedups_across_insertion() {
+        let dir = tmp_dir("cdc");
+        let vault_path = dir.join("c.vault");
+        let _ = std::fs::remove_file(&vault_path);
+
+        // Base de 1 MiB e uma versão com 137 bytes inseridos no INÍCIO.
+        // Com chunking fixo, a inserção deslocaria tudo -> ~0 dedup.
+        // Com FastCDC, as fronteiras re-sincronizam -> maioria dos blocos compartilhada.
+        let base = pseudo_random(12_345, 1 << 20);
+        let mut modified = pseudo_random(999, 137);
+        modified.extend_from_slice(&base);
+
+        let a = dir.join("a.bin");
+        let b = dir.join("b.bin");
+        std::fs::write(&a, &base).unwrap();
+        std::fs::write(&b, &modified).unwrap();
+
+        let mut v = Vault::create(&vault_path, DEFAULT_AVG_CHUNK).unwrap();
+        v.add_file(&a, "a.bin").unwrap();
+        let blocks_a = v.stats().unique_blocks;
+        assert!(blocks_a > 4, "1 MiB deveria virar vários chunks (got {blocks_a})");
+
+        v.add_file(&b, "b.bin").unwrap();
+        let blocks_b = v.stats().unique_blocks;
+        let added = blocks_b - blocks_a;
+
+        // O arquivo modificado deve adicionar bem menos blocos do que recriaria
+        // do zero — prova de que o dedup sobreviveu à inserção.
+        assert!(
+            added * 2 < blocks_a,
+            "FastCDC deveria compartilhar a maioria dos blocos após inserção \
+             (a={blocks_a}, novos em b={added})"
+        );
+
+        // E o round-trip do arquivo modificado tem que bater exatamente.
+        let mut out = Cursor::new(Vec::new());
+        v.extract("b.bin", &mut out).unwrap();
+        assert_eq!(out.into_inner(), modified);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
