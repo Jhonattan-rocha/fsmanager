@@ -38,23 +38,23 @@
     <main id="workspace" class="workspace hidden">
       <div class="stats" id="stats"></div>
 
-      <div class="actions">
-        <button id="btnAdd" class="primary">➕ Adicionar arquivos</button>
-        <button id="btnMount">🔌 Montar como drive</button>
-        <button id="btnGc">🧹 Compactar (gc)</button>
-        <button id="btnClose" class="ghost">✕ Fechar</button>
+      <div class="toolbar">
+        <nav class="breadcrumbs" id="breadcrumbs"></nav>
+        <div class="tools">
+          <button id="btnAdd" class="primary">➕ Adicionar</button>
+          <button id="btnNewFolder">📁 Nova pasta</button>
+          <button id="btnMount">🔌 Montar</button>
+          <button id="btnGc">🧹 Compactar</button>
+          <button id="btnClose" class="ghost">✕ Fechar</button>
+        </div>
       </div>
 
       <div class="panels">
         <div class="panel">
-          <div class="panel-head">
-            <h3>Arquivos</h3>
-            <input id="filter" class="filter" placeholder="filtrar…" />
-          </div>
-          <div class="table-wrap">
+          <div class="table-wrap" id="fileArea">
             <table>
               <thead>
-                <tr><th>Caminho</th><th class="num">Tamanho</th><th class="num">Modificado</th><th></th></tr>
+                <tr><th>Nome</th><th class="num">Tamanho</th><th class="num">Modificado</th><th></th></tr>
               </thead>
               <tbody id="fileList"></tbody>
             </table>
@@ -69,8 +69,20 @@
           <ul id="snapList" class="snap-list"></ul>
         </div>
       </div>
+
+      <div id="progress" class="progress hidden">
+        <div class="progress-label" id="progressLabel"></div>
+        <div class="progress-track"><div class="progress-bar" id="progressBar"></div></div>
+      </div>
+
+      <div id="dropOverlay" class="drop-overlay hidden">
+        <div class="drop-card">⬇️ Solte para adicionar nesta pasta</div>
+      </div>
       <p id="workError" class="error"></p>
     </main>
+
+    <!-- Menu de contexto (clique direito) -->
+    <div id="ctxMenu" class="ctx-menu hidden"></div>
 
     <!-- Tela de drive montado -->
     <section id="mounted" class="welcome hidden">

@@ -1,12 +1,18 @@
 const { invoke } = window.__TAURI__.core;
 const tauriEvent = window.__TAURI__.event;
 
-// ----------------------- estado da UI -----------------------
-let current = null; // último VaultInfo recebido
-let fileFilter = "";
+// ----------------------- estado -----------------------
+let vaultOpen = false;
+let currentPath = "/";
+let lastInfo = null;
 
 // ----------------------- utilidades -----------------------
+function $(id) {
+  return document.getElementById(id);
+}
+
 function fmtBytes(n) {
+  if (n == null) return "—";
   if (n < 1024) return `${n} B`;
   const u = ["KB", "MB", "GB", "TB"];
   let i = -1;
@@ -16,18 +22,18 @@ function fmtBytes(n) {
   } while (n >= 1024 && i < u.length - 1);
   return `${n.toFixed(1)} ${u[i]}`;
 }
-
 function fmtPct(x) {
   return `${(x * 100).toFixed(1)}%`;
 }
-
 function fmtDate(secs) {
   if (!secs) return "—";
   return new Date(secs * 1000).toLocaleString("pt-BR");
 }
-
-function $(id) {
-  return document.getElementById(id);
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function joinPath(dir, name) {
+  return dir === "/" ? `/${name}` : `${dir}/${name}`;
 }
 
 let toastTimer = null;
@@ -37,44 +43,112 @@ function toast(msg, isError = false, sticky = false) {
   el.classList.toggle("error", isError);
   el.classList.remove("hidden");
   clearTimeout(toastTimer);
-  if (!sticky) {
-    toastTimer = setTimeout(() => el.classList.add("hidden"), 3200);
-  }
+  if (!sticky) toastTimer = setTimeout(() => el.classList.add("hidden"), 3200);
 }
 
 async function call(cmd, args = {}) {
   return await invoke(cmd, args);
 }
 
-// ----------------------- renderização -----------------------
+async function guarded(fn, errEl = "workError") {
+  try {
+    if ($(errEl)) $(errEl).textContent = "";
+    await fn();
+  } catch (e) {
+    const msg = typeof e === "string" ? e : e?.message || String(e);
+    if (msg.includes("cancel")) return; // cancelamento de diálogo é silencioso
+    if ($(errEl)) $(errEl).textContent = msg;
+    toast(msg, true);
+  }
+}
+
+function password() {
+  return $("password").value || null;
+}
+
+// ----------------------- telas -----------------------
 function showWelcome() {
-  current = null;
+  vaultOpen = false;
   $("welcome").classList.remove("hidden");
   $("workspace").classList.add("hidden");
   $("mounted").classList.add("hidden");
   $("vaultPath").classList.add("hidden");
 }
-
 function showMounted(mountpoint) {
-  current = null;
+  vaultOpen = false;
   $("welcome").classList.add("hidden");
   $("workspace").classList.add("hidden");
   $("mounted").classList.remove("hidden");
   $("mountAt").textContent = mountpoint;
 }
-
-function render(info) {
-  current = info;
+async function openWorkspace(info) {
+  vaultOpen = true;
+  lastInfo = info;
+  currentPath = "/";
   $("welcome").classList.add("hidden");
+  $("mounted").classList.add("hidden");
   $("workspace").classList.remove("hidden");
-
-  const pathEl = $("vaultPath");
-  pathEl.textContent = info.path;
-  pathEl.classList.remove("hidden");
-
+  $("vaultPath").textContent = info.path;
+  $("vaultPath").classList.remove("hidden");
   renderStats(info.stats);
-  renderFiles(info.files);
   renderSnapshots(info.snapshots);
+  await navigate("/");
+}
+
+// ----------------------- navegação -----------------------
+async function refresh() {
+  const entries = await call("list_dir", { path: currentPath });
+  renderBreadcrumbs(currentPath);
+  renderFiles(entries);
+  const info = await call("get_info");
+  lastInfo = info;
+  renderStats(info.stats);
+  renderSnapshots(info.snapshots);
+}
+async function navigate(path) {
+  currentPath = path || "/";
+  await refresh();
+}
+
+function renderBreadcrumbs(path) {
+  const el = $("breadcrumbs");
+  const parts = path.split("/").filter(Boolean);
+  let acc = "";
+  let html = `<button class="crumb" data-path="/">🗄️ Cofre</button>`;
+  for (const p of parts) {
+    acc += `/${p}`;
+    html += `<span class="crumb-sep">/</span><button class="crumb" data-path="${escapeHtml(acc)}">${escapeHtml(p)}</button>`;
+  }
+  el.innerHTML = html;
+}
+
+function renderFiles(entries) {
+  const tbody = $("fileList");
+  // Pastas primeiro, depois arquivos; cada grupo em ordem alfabética.
+  const sorted = [...entries].sort((a, b) => {
+    if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+  if (sorted.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="4" class="empty">pasta vazia — arraste arquivos aqui ou use ➕ Adicionar</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = sorted
+    .map((e) => {
+      const icon = e.is_dir ? "📁" : "📄";
+      const size = e.is_dir ? "—" : fmtBytes(e.size);
+      const date = e.is_dir ? "—" : fmtDate(e.mtime);
+      const actions = e.is_dir
+        ? `<button class="small" data-act="rename">✏️</button><button class="small danger" data-act="remove">🗑️</button>`
+        : `<button class="small" data-act="extract">⬇️</button><button class="small" data-act="rename">✏️</button><button class="small danger" data-act="remove">🗑️</button>`;
+      return `<tr data-name="${escapeHtml(e.name)}" data-dir="${e.is_dir ? 1 : 0}">
+        <td class="name ${e.is_dir ? "is-dir" : ""}">${icon} ${escapeHtml(e.name)}</td>
+        <td class="num">${size}</td>
+        <td class="num dim">${date}</td>
+        <td class="row-actions">${actions}</td>
+      </tr>`;
+    })
+    .join("");
 }
 
 function renderStats(s) {
@@ -91,150 +165,186 @@ function renderStats(s) {
   ];
   $("stats").innerHTML =
     `<div class="badge state">${lock}</div>` +
-    badges
-      .map(
-        ([k, v]) =>
-          `<div class="badge"><span class="k">${k}</span><span class="v">${v}</span></div>`
-      )
-      .join("");
-}
-
-function renderFiles(files) {
-  const tbody = $("fileList");
-  const f = fileFilter.trim().toLowerCase();
-  const rows = files.filter((x) => !f || x.path.toLowerCase().includes(f));
-  if (rows.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="4" class="empty">nenhum arquivo</td></tr>`;
-    return;
-  }
-  tbody.innerHTML = rows
-    .map(
-      (x) => `
-      <tr>
-        <td class="path">${escapeHtml(x.path)}</td>
-        <td class="num">${fmtBytes(x.size)}</td>
-        <td class="num dim">${fmtDate(x.mtime)}</td>
-        <td class="row-actions">
-          <button class="small" data-act="extract" data-path="${escapeAttr(x.path)}">⬇️</button>
-          <button class="small danger" data-act="remove" data-path="${escapeAttr(x.path)}">🗑️</button>
-        </td>
-      </tr>`
-    )
-    .join("");
+    badges.map(([k, v]) => `<div class="badge"><span class="k">${k}</span><span class="v">${v}</span></div>`).join("");
 }
 
 function renderSnapshots(snaps) {
   const ul = $("snapList");
-  if (snaps.length === 0) {
+  if (!snaps || snaps.length === 0) {
     ul.innerHTML = `<li class="empty">nenhum snapshot</li>`;
     return;
   }
   ul.innerHTML = snaps
     .map(
-      (s) => `
-      <li>
+      (sn) => `<li>
         <div class="snap-info">
-          <span class="snap-name">${escapeHtml(s.name)}</span>
-          <span class="snap-meta">${s.files} arq · ${fmtBytes(s.size)} · ${fmtDate(s.created)}</span>
+          <span class="snap-name">${escapeHtml(sn.name)}</span>
+          <span class="snap-meta">${sn.files} arq · ${fmtBytes(sn.size)} · ${fmtDate(sn.created)}</span>
         </div>
         <div class="snap-actions">
-          <button class="small" data-snap-act="restore" data-name="${escapeAttr(s.name)}">↩️ Restaurar</button>
-          <button class="small danger" data-snap-act="delete" data-name="${escapeAttr(s.name)}">🗑️</button>
+          <button class="small" data-snap-act="restore" data-name="${escapeHtml(sn.name)}">↩️</button>
+          <button class="small danger" data-snap-act="delete" data-name="${escapeHtml(sn.name)}">🗑️</button>
         </div>
       </li>`
     )
     .join("");
 }
 
-function escapeHtml(str) {
-  return str.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+// ----------------------- progresso -----------------------
+function showProgress() {
+  $("progress").classList.remove("hidden");
 }
-function escapeAttr(str) {
-  return escapeHtml(str);
-}
-
-// ----------------------- ações -----------------------
-async function guarded(fn, errEl = "workError") {
-  try {
-    $(errEl).textContent = "";
-    await fn();
-  } catch (e) {
-    const msg = typeof e === "string" ? e : e?.message || String(e);
-    if (msg.includes("cancel")) return; // cancelamento de diálogo é silencioso
-    $(errEl).textContent = msg;
-    toast(msg, true);
-  }
+function hideProgress() {
+  $("progress").classList.add("hidden");
+  $("progressBar").style.width = "0%";
+  $("progressLabel").textContent = "";
 }
 
-function password() {
-  return $("password").value || null;
+// ----------------------- menu de contexto -----------------------
+function hideCtx() {
+  $("ctxMenu").classList.add("hidden");
+}
+function showCtx(x, y, items) {
+  const el = $("ctxMenu");
+  el.innerHTML = items
+    .map((it, i) => `<button data-i="${i}" class="${it.danger ? "danger" : ""}">${it.label}</button>`)
+    .join("");
+  el.style.left = `${x}px`;
+  el.style.top = `${y}px`;
+  el.classList.remove("hidden");
+  el._items = items;
+}
+
+// ----------------------- ações de entrada -----------------------
+function entryActions(name, isDir) {
+  const full = joinPath(currentPath, name);
+  return {
+    open: () => navigate(full),
+    extract: () =>
+      guarded(async () => {
+        const saved = await call("extract_file", { logical: full });
+        if (saved) toast(`extraído para ${saved}`);
+      }),
+    rename: () =>
+      guarded(async () => {
+        const novo = prompt("Novo nome:", name);
+        if (!novo || novo === name) return;
+        await call("rename_path", { from: full, to: joinPath(currentPath, novo) });
+        await refresh();
+        toast("renomeado");
+      }),
+    remove: () =>
+      guarded(async () => {
+        const what = isDir ? `a pasta "${name}" e tudo dentro dela` : `"${name}"`;
+        if (!confirm(`Remover ${what}?`)) return;
+        await call("remove_path", { logical: full, recursive: isDir });
+        await refresh();
+        toast("removido");
+      }),
+  };
 }
 
 // ----------------------- wiring -----------------------
 window.addEventListener("DOMContentLoaded", () => {
-  // Progresso de adição de arquivos (evento emitido pelo backend).
+  // Progresso de adição.
   if (tauriEvent && tauriEvent.listen) {
     tauriEvent.listen("add-progress", (e) => {
       const { file, done, total } = e.payload || {};
       const pct = total ? Math.round((done / total) * 100) : 0;
-      toast(
-        `⏳ Adicionando ${file} — ${pct}%  (${fmtBytes(done)} / ${fmtBytes(total)})`,
-        false,
-        true
-      );
+      showProgress();
+      $("progressBar").style.width = `${pct}%`;
+      $("progressLabel").textContent = `Adicionando ${file} — ${pct}% (${fmtBytes(done)} / ${fmtBytes(total)})`;
     });
+
+    // Arrastar-e-soltar arquivos (nomes de evento variam entre versões do Tauri).
+    const onDragEnter = () => {
+      if (vaultOpen) $("dropOverlay").classList.remove("hidden");
+    };
+    const onDragLeave = () => $("dropOverlay").classList.add("hidden");
+    const onDrop = (e) => {
+      $("dropOverlay").classList.add("hidden");
+      if (!vaultOpen) return;
+      // Payload pode ser { paths } (novo) ou um array de caminhos (antigo).
+      const p = e.payload;
+      const paths = Array.isArray(p) ? p : (p && p.paths) || [];
+      if (!paths.length) return;
+      const dest = currentPath;
+      guarded(async () => {
+        showProgress();
+        try {
+          const n = await call("add_dropped", { paths, dest_dir: dest });
+          await refresh();
+          if (n > 0) toast(`${n} item(ns) adicionado(s)`);
+        } finally {
+          hideProgress();
+        }
+      });
+    };
+    ["tauri://drag-enter", "tauri://file-drop-hover"].forEach((ev) => tauriEvent.listen(ev, onDragEnter));
+    ["tauri://drag-leave", "tauri://file-drop-cancelled"].forEach((ev) => tauriEvent.listen(ev, onDragLeave));
+    ["tauri://drag-drop", "tauri://file-drop"].forEach((ev) => tauriEvent.listen(ev, onDrop));
   }
 
+  // --- welcome ---
   $("btnOpen").addEventListener("click", () =>
     guarded(async () => {
       toast("⏳ Abrindo cofre…", false, true);
       const info = await call("open_vault", { password: password() });
-      render(info);
+      await openWorkspace(info);
       toast("cofre aberto");
     }, "welcomeError")
   );
-
   $("btnCreate").addEventListener("click", () =>
     guarded(async () => {
       toast("⏳ Criando cofre…", false, true);
       const info = await call("create_vault", { password: password() });
-      render(info);
+      await openWorkspace(info);
       toast("cofre criado");
     }, "welcomeError")
   );
 
+  // --- toolbar ---
   $("btnClose").addEventListener("click", () =>
     guarded(async () => {
       await call("close_vault");
       showWelcome();
     })
   );
-
   $("btnAdd").addEventListener("click", () =>
     guarded(async () => {
-      toast("⏳ Adicionando… arquivos grandes podem levar um tempo", false, true);
-      const info = await call("add_files");
-      render(info);
-      toast("arquivos adicionados");
+      const dest = currentPath;
+      showProgress();
+      try {
+        const n = await call("add_files", { dest_dir: dest });
+        await refresh();
+        if (n > 0) toast(`${n} arquivo(s) adicionado(s)`);
+      } finally {
+        hideProgress();
+      }
     })
   );
-
+  $("btnNewFolder").addEventListener("click", () =>
+    guarded(async () => {
+      const nome = prompt("Nome da nova pasta:");
+      if (!nome) return;
+      await call("make_dir", { path: joinPath(currentPath, nome) });
+      await refresh();
+      toast("pasta criada");
+    })
+  );
   $("btnGc").addEventListener("click", () =>
     guarded(async () => {
       toast("⏳ Compactando…", false, true);
-      const info = await call("gc_vault");
-      render(info);
+      await call("gc_vault");
+      await refresh();
       toast("container compactado");
     })
   );
-
   $("btnMount").addEventListener("click", () =>
     guarded(async () => {
       const isWin = navigator.userAgent.includes("Windows");
       const def = isWin ? "X:" : "/mnt/fsm";
-      const hint = isWin
-        ? "Letra de drive (ex: X:)"
-        : "Diretório de montagem (ex: /mnt/fsm — deve existir)";
+      const hint = isWin ? "Letra de drive (ex: X:)" : "Diretório de montagem (ex: /mnt/fsm — deve existir)";
       const mp = prompt(hint, def);
       if (!mp) return;
       const at = await call("mount_drive", { mountpoint: mp });
@@ -242,7 +352,6 @@ window.addEventListener("DOMContentLoaded", () => {
       toast(`montado em ${at}`);
     })
   );
-
   $("btnUnmount").addEventListener("click", () =>
     guarded(async () => {
       await call("unmount_drive");
@@ -250,61 +359,83 @@ window.addEventListener("DOMContentLoaded", () => {
       toast("desmontado");
     }, "mountError")
   );
-
   $("btnSnap").addEventListener("click", () =>
     guarded(async () => {
       const name = prompt("Nome do snapshot:");
       if (!name) return;
-      const info = await call("snapshot_create", { name });
-      render(info);
+      await call("snapshot_create", { name });
+      await refresh();
       toast(`snapshot "${name}" criado`);
     })
   );
 
-  $("filter").addEventListener("input", (e) => {
-    fileFilter = e.target.value;
-    if (current) renderFiles(current.files);
+  // --- breadcrumbs ---
+  $("breadcrumbs").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-path]");
+    if (btn) guarded(() => navigate(btn.dataset.path));
   });
 
-  // Delegação para ações das linhas de arquivo.
+  // --- lista de arquivos: navegação, ações, menu de contexto ---
   $("fileList").addEventListener("click", (e) => {
     const btn = e.target.closest("button[data-act]");
     if (!btn) return;
-    const path = btn.dataset.path;
-    const act = btn.dataset.act;
-    if (act === "extract") {
-      guarded(async () => {
-        const saved = await call("extract_file", { logical: path });
-        if (saved) toast(`extraído para ${saved}`);
-      });
-    } else if (act === "remove") {
-      guarded(async () => {
-        if (!confirm(`Remover "${path}"?`)) return;
-        const info = await call("remove_path", { logical: path, recursive: false });
-        render(info);
-        toast("removido");
-      });
-    }
+    const tr = btn.closest("tr");
+    const acts = entryActions(tr.dataset.name, tr.dataset.dir === "1");
+    acts[btn.dataset.act]();
   });
+  $("fileList").addEventListener("dblclick", (e) => {
+    const tr = e.target.closest("tr[data-name]");
+    if (!tr) return;
+    const isDir = tr.dataset.dir === "1";
+    const acts = entryActions(tr.dataset.name, isDir);
+    isDir ? acts.open() : acts.extract();
+  });
+  $("fileList").addEventListener("contextmenu", (e) => {
+    const tr = e.target.closest("tr[data-name]");
+    if (!tr) return;
+    e.preventDefault();
+    const isDir = tr.dataset.dir === "1";
+    const acts = entryActions(tr.dataset.name, isDir);
+    const items = isDir
+      ? [
+          { label: "📂 Abrir", fn: acts.open },
+          { label: "✏️ Renomear", fn: acts.rename },
+          { label: "🗑️ Excluir", fn: acts.remove, danger: true },
+        ]
+      : [
+          { label: "⬇️ Extrair", fn: acts.extract },
+          { label: "✏️ Renomear", fn: acts.rename },
+          { label: "🗑️ Excluir", fn: acts.remove, danger: true },
+        ];
+    showCtx(e.clientX, e.clientY, items);
+  });
+  $("ctxMenu").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-i]");
+    if (!btn) return;
+    const items = $("ctxMenu")._items || [];
+    hideCtx();
+    items[+btn.dataset.i]?.fn();
+  });
+  window.addEventListener("click", () => hideCtx());
+  window.addEventListener("scroll", () => hideCtx(), true);
 
-  // Delegação para ações de snapshot.
+  // --- snapshots ---
   $("snapList").addEventListener("click", (e) => {
     const btn = e.target.closest("button[data-snap-act]");
     if (!btn) return;
     const name = btn.dataset.name;
-    const act = btn.dataset.snapAct;
-    if (act === "restore") {
+    if (btn.dataset.snapAct === "restore") {
       guarded(async () => {
         if (!confirm(`Restaurar a árvore para o snapshot "${name}"? Isso substitui os arquivos atuais.`)) return;
-        const info = await call("snapshot_restore", { name });
-        render(info);
+        await call("snapshot_restore", { name });
+        await navigate("/");
         toast(`restaurado para "${name}"`);
       });
-    } else if (act === "delete") {
+    } else {
       guarded(async () => {
         if (!confirm(`Apagar o snapshot "${name}"?`)) return;
-        const info = await call("snapshot_delete", { name });
-        render(info);
+        await call("snapshot_delete", { name });
+        await refresh();
         toast("snapshot apagado");
       });
     }

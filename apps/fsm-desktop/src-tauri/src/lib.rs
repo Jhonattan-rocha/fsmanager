@@ -34,8 +34,9 @@ struct MountProc {
 // ----------------------- DTOs para a UI -----------------------
 
 #[derive(Serialize)]
-struct FileDto {
-    path: String,
+struct DirEntryDto {
+    name: String,
+    is_dir: bool,
     size: u64,
     mtime: i64,
 }
@@ -70,12 +71,12 @@ struct AddProgress {
     total: u64,
 }
 
-/// Tudo o que a UI precisa para renderizar o estado atual do vault.
+/// Estado geral do vault (stats + snapshots). A navegação de arquivos é por
+/// pasta, via `list_dir`.
 #[derive(Serialize)]
 struct VaultInfo {
     path: String,
     stats: StatsDto,
-    files: Vec<FileDto>,
     snapshots: Vec<SnapshotDto>,
 }
 
@@ -102,16 +103,6 @@ fn stats_dto(v: &Vault) -> StatsDto {
 }
 
 fn build_info(path: &str, v: &Vault) -> VaultInfo {
-    let files = v
-        .catalog()
-        .files
-        .iter()
-        .map(|(p, e)| FileDto {
-            path: p.clone(),
-            size: e.size,
-            mtime: e.mtime,
-        })
-        .collect();
     let snapshots = v
         .snapshots()
         .iter()
@@ -125,21 +116,69 @@ fn build_info(path: &str, v: &Vault) -> VaultInfo {
     VaultInfo {
         path: path.to_string(),
         stats: stats_dto(v),
-        files,
         snapshots,
     }
 }
 
-/// Aplica `f` ao vault aberto e devolve o estado atualizado.
-fn mutate(state: &State<AppState>, f: impl FnOnce(&mut Vault) -> Result<(), String>) -> Result<VaultInfo, String> {
+/// Executa `f` sobre o vault aberto.
+fn with_vault<T>(
+    state: &State<AppState>,
+    f: impl FnOnce(&mut Vault) -> Result<T, String>,
+) -> Result<T, String> {
     let mut guard = state.open.lock().unwrap();
     let ov = guard.as_mut().ok_or("nenhum container aberto")?;
-    f(&mut ov.vault)?;
-    Ok(build_info(&ov.path, &ov.vault))
+    f(&mut ov.vault)
 }
 
 fn empty_to_none(p: Option<String>) -> Option<String> {
     p.filter(|x| !x.is_empty())
+}
+
+/// Junta um diretório lógico com um nome de arquivo/pasta.
+fn join_logical(dir: &str, name: &str) -> String {
+    if dir.is_empty() || dir == "/" {
+        format!("/{name}")
+    } else {
+        format!("{}/{name}", dir.trim_end_matches('/'))
+    }
+}
+
+/// Adiciona `sources` (caminhos do disco) dentro de `dest_dir`, emitindo
+/// progresso. Retorna quantos arquivos foram adicionados.
+fn add_sources(
+    app: &tauri::AppHandle,
+    ov: &mut OpenVault,
+    sources: &[String],
+    dest_dir: &str,
+) -> Result<usize, String> {
+    for src in sources {
+        let name = Path::new(src)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "arquivo".into());
+        let dest = join_logical(dest_dir, &name);
+        let total = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+        let app2 = app.clone();
+        let fname = name.clone();
+        let mut last_emit = 0u64;
+        ov.vault
+            .add_file_progress(src, &dest, |done| {
+                if done.saturating_sub(last_emit) >= 4 * 1024 * 1024 || done >= total {
+                    last_emit = done;
+                    let _ = app2.emit(
+                        "add-progress",
+                        AddProgress {
+                            file: fname.clone(),
+                            done,
+                            total,
+                        },
+                    );
+                }
+            })
+            .map_err(s)?;
+    }
+    ov.vault.commit().map_err(s)?;
+    Ok(sources.len())
 }
 
 // ----------------------- comandos -----------------------
@@ -201,47 +240,72 @@ fn close_vault(state: State<AppState>) -> Result<(), String> {
 
 #[tauri::command]
 fn get_info(state: State<AppState>) -> Result<VaultInfo, String> {
-    mutate(&state, |_| Ok(()))
+    let guard = state.open.lock().unwrap();
+    let ov = guard.as_ref().ok_or("nenhum container aberto")?;
+    Ok(build_info(&ov.path, &ov.vault))
 }
 
+/// Lista os filhos imediatos (pastas + arquivos) de um diretório lógico.
+#[tauri::command]
+fn list_dir(state: State<AppState>, path: String) -> Result<Vec<DirEntryDto>, String> {
+    with_vault(&state, |v| {
+        Ok(v.list_dir(&path)
+            .into_iter()
+            .map(|e| DirEntryDto {
+                name: e.name,
+                is_dir: e.is_dir,
+                size: e.size,
+                mtime: e.mtime,
+            })
+            .collect())
+    })
+}
+
+/// Cria uma pasta (diretório explícito).
+#[tauri::command]
+fn make_dir(state: State<AppState>, path: String) -> Result<(), String> {
+    with_vault(&state, |v| {
+        v.create_dir(&path).map_err(s)?;
+        v.commit().map_err(s)
+    })
+}
+
+/// Abre um seletor de arquivos e adiciona os escolhidos dentro de `dest_dir`.
 #[tauri::command(async)]
-fn add_files(app: tauri::AppHandle, state: State<AppState>) -> Result<VaultInfo, String> {
+fn add_files(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    dest_dir: String,
+) -> Result<usize, String> {
     let picked = app.dialog().file().blocking_pick_files();
     let files = match picked {
         Some(fs) if !fs.is_empty() => fs,
-        _ => return Err("nenhum arquivo selecionado".into()),
+        _ => return Ok(0), // cancelado: no-op silencioso
     };
+    let sources: Vec<String> = files.iter().map(|f| f.to_string()).collect();
     let mut guard = state.open.lock().unwrap();
     let ov = guard.as_mut().ok_or("nenhum container aberto")?;
-    for fp in &files {
-        let src = fp.to_string();
-        let name = Path::new(&src)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "arquivo".into());
-        let total = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
-        let app2 = app.clone();
-        let fname = name.clone();
-        let mut last_emit = 0u64;
-        ov.vault
-            .add_file_progress(&src, &name, |done| {
-                // Throttle: emite a cada ~4 MB (ou no fim) para não inundar a UI.
-                if done.saturating_sub(last_emit) >= 4 * 1024 * 1024 || done >= total {
-                    last_emit = done;
-                    let _ = app2.emit(
-                        "add-progress",
-                        AddProgress {
-                            file: fname.clone(),
-                            done,
-                            total,
-                        },
-                    );
-                }
-            })
-            .map_err(s)?;
+    add_sources(&app, ov, &sources, &dest_dir)
+}
+
+/// Adiciona arquivos arrastados (drag-and-drop) dentro de `dest_dir`.
+#[tauri::command(async)]
+fn add_dropped(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    paths: Vec<String>,
+    dest_dir: String,
+) -> Result<usize, String> {
+    let sources: Vec<String> = paths
+        .into_iter()
+        .filter(|p| Path::new(p).is_file())
+        .collect();
+    if sources.is_empty() {
+        return Ok(0); // só pastas / nada válido: no-op (pastas ainda não recursam)
     }
-    ov.vault.commit().map_err(s)?;
-    Ok(build_info(&ov.path, &ov.vault))
+    let mut guard = state.open.lock().unwrap();
+    let ov = guard.as_mut().ok_or("nenhum container aberto")?;
+    add_sources(&app, ov, &sources, &dest_dir)
 }
 
 #[tauri::command(async)]
@@ -268,12 +332,8 @@ fn extract_file(
 }
 
 #[tauri::command]
-fn remove_path(
-    state: State<AppState>,
-    logical: String,
-    recursive: bool,
-) -> Result<VaultInfo, String> {
-    mutate(&state, |v| {
+fn remove_path(state: State<AppState>, logical: String, recursive: bool) -> Result<(), String> {
+    with_vault(&state, |v| {
         if recursive {
             v.remove_dir(&logical).map_err(s)?;
         } else if !v.remove(&logical).map_err(s)? {
@@ -284,32 +344,32 @@ fn remove_path(
 }
 
 #[tauri::command]
-fn rename_path(state: State<AppState>, from: String, to: String) -> Result<VaultInfo, String> {
-    mutate(&state, |v| {
+fn rename_path(state: State<AppState>, from: String, to: String) -> Result<(), String> {
+    with_vault(&state, |v| {
         v.rename(&from, &to).map_err(s)?;
         v.commit().map_err(s)
     })
 }
 
 #[tauri::command]
-fn snapshot_create(state: State<AppState>, name: String) -> Result<VaultInfo, String> {
-    mutate(&state, |v| {
+fn snapshot_create(state: State<AppState>, name: String) -> Result<(), String> {
+    with_vault(&state, |v| {
         v.snapshot_create(&name).map_err(s)?;
         v.commit().map_err(s)
     })
 }
 
 #[tauri::command]
-fn snapshot_restore(state: State<AppState>, name: String) -> Result<VaultInfo, String> {
-    mutate(&state, |v| {
+fn snapshot_restore(state: State<AppState>, name: String) -> Result<(), String> {
+    with_vault(&state, |v| {
         v.snapshot_restore(&name).map_err(s)?;
         v.commit().map_err(s)
     })
 }
 
 #[tauri::command]
-fn snapshot_delete(state: State<AppState>, name: String) -> Result<VaultInfo, String> {
-    mutate(&state, |v| {
+fn snapshot_delete(state: State<AppState>, name: String) -> Result<(), String> {
+    with_vault(&state, |v| {
         if !v.snapshot_delete(&name).map_err(s)? {
             return Err(format!("snapshot não encontrado: {name}"));
         }
@@ -319,7 +379,7 @@ fn snapshot_delete(state: State<AppState>, name: String) -> Result<VaultInfo, St
 
 /// Compacta o container: escreve em arquivo temporário, substitui e reabre.
 #[tauri::command(async)]
-fn gc_vault(state: State<AppState>) -> Result<VaultInfo, String> {
+fn gc_vault(state: State<AppState>) -> Result<(), String> {
     let mut guard = state.open.lock().unwrap();
     let ov = guard.take().ok_or("nenhum container aberto")?;
     let OpenVault { path, password, mut vault } = ov;
@@ -340,9 +400,8 @@ fn gc_vault(state: State<AppState>) -> Result<VaultInfo, String> {
 
     std::fs::rename(&tmp, &path).map_err(s)?;
     let vault = Vault::open(&path, password.as_deref()).map_err(s)?;
-    let info = build_info(&path, &vault);
     *guard = Some(OpenVault { path, password, vault });
-    Ok(info)
+    Ok(())
 }
 
 /// Localiza o binário `fsm-mount` (env `FSM_MOUNT_BIN`, ao lado do exe, ou alvos de dev).
@@ -452,7 +511,10 @@ pub fn run() {
             open_vault,
             close_vault,
             get_info,
+            list_dir,
+            make_dir,
             add_files,
+            add_dropped,
             extract_file,
             remove_path,
             rename_path,

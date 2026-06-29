@@ -337,3 +337,128 @@ tbody tr:hover {
 .toast.error {
   border-left-color: var(--danger);
 }
+
+/* ---------- toolbar + breadcrumbs ---------- */
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.breadcrumbs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-wrap: wrap;
+  font-size: 14px;
+  min-width: 0;
+}
+.crumb {
+  background: transparent;
+  border: none;
+  color: var(--text);
+  padding: 4px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+}
+.crumb:hover {
+  background: var(--panel-2);
+  border-color: transparent;
+}
+.crumb-sep {
+  color: var(--dim);
+}
+.tools {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* ---------- nome de arquivo/pasta ---------- */
+.name {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+.name.is-dir {
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+}
+tbody tr {
+  user-select: none;
+}
+
+/* ---------- barra de progresso ---------- */
+.progress {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 14px;
+}
+.progress-label {
+  font-size: 12px;
+  color: var(--dim);
+  margin-bottom: 6px;
+}
+.progress-track {
+  height: 8px;
+  background: var(--panel-2);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.progress-bar {
+  height: 100%;
+  width: 0;
+  background: linear-gradient(90deg, var(--accent-2), var(--accent));
+  transition: width 0.15s ease;
+}
+
+/* ---------- overlay de drag-and-drop ---------- */
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 17, 21, 0.7);
+  display: grid;
+  place-items: center;
+  z-index: 50;
+  pointer-events: none;
+}
+.drop-card {
+  border: 2px dashed var(--accent);
+  border-radius: 16px;
+  padding: 40px 60px;
+  font-size: 18px;
+  color: var(--text);
+  background: var(--panel);
+}
+
+/* ---------- menu de contexto ---------- */
+.ctx-menu {
+  position: fixed;
+  z-index: 100;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  min-width: 150px;
+}
+.ctx-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--text);
+}
+.ctx-menu button:hover {
+  background: var(--accent-2);
+}
+.ctx-menu button.danger:hover {
+  background: var(--danger);
+}

@@ -5,3 +5,5 @@ Cargo.lock
 fsm-mount/target
 fsm-cli/target
 fsm-core/target
+/dist
+node_modules
