@@ -61,6 +61,8 @@ struct StatsDto {
     dedup_savings: f64,
     compression_savings: f64,
     total_savings: f64,
+    quota: Option<u64>,
+    used_bytes: u64,
 }
 
 /// Progresso de adição de arquivo, emitido como evento `add-progress`.
@@ -99,6 +101,8 @@ fn stats_dto(v: &Vault) -> StatsDto {
         dedup_savings: st.dedup_savings(),
         compression_savings: st.compression_savings(),
         total_savings: st.total_savings(),
+        quota: st.quota,
+        used_bytes: st.used_bytes,
     }
 }
 
@@ -404,6 +408,49 @@ fn gc_vault(state: State<AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Define ou limpa a cota de tamanho do cofre (bytes; `None` = sem limite).
+#[tauri::command]
+fn set_quota(state: State<AppState>, bytes: Option<u64>) -> Result<(), String> {
+    with_vault(&state, |v| {
+        v.set_quota(bytes);
+        v.commit().map_err(s)
+    })
+}
+
+/// Define, troca ou remove a senha do cofre (rekey: re-encripta tudo).
+/// `new_password` vazio/None = remover senha.
+#[tauri::command(async)]
+fn change_password(
+    state: State<AppState>,
+    new_password: Option<String>,
+) -> Result<(), String> {
+    let mut guard = state.open.lock().unwrap();
+    let ov = guard.take().ok_or("nenhum container aberto")?;
+    let OpenVault { path, password, mut vault } = ov;
+    let new_pw = empty_to_none(new_password);
+
+    let tmp = format!("{path}.rekeying");
+    if Path::new(&tmp).exists() {
+        std::fs::remove_file(&tmp).map_err(s)?;
+    }
+    let result = vault.rekey_to(&tmp, new_pw.as_deref());
+    drop(vault); // fecha o handle do original antes de substituir
+
+    if let Err(e) = result {
+        let reopened = Vault::open(&path, password.as_deref()).map_err(s)?;
+        *guard = Some(OpenVault { path, password, vault: reopened });
+        return Err(s(e));
+    }
+    std::fs::rename(&tmp, &path).map_err(s)?;
+    let vault = Vault::open(&path, new_pw.as_deref()).map_err(s)?;
+    *guard = Some(OpenVault {
+        path,
+        password: new_pw,
+        vault,
+    });
+    Ok(())
+}
+
 /// Localiza o binário `fsm-mount` (env `FSM_MOUNT_BIN`, ao lado do exe, ou alvos de dev).
 fn resolve_mount_bin() -> Result<std::path::PathBuf, String> {
     let name = if cfg!(windows) {
@@ -522,6 +569,8 @@ pub fn run() {
             snapshot_restore,
             snapshot_delete,
             gc_vault,
+            set_quota,
+            change_password,
             mount_drive,
             unmount_drive,
             mount_status,

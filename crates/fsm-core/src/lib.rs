@@ -49,7 +49,7 @@ pub const HEADER_SIZE: u64 = 4096;
 /// os blocos seguintes, então o dedup sobrevive a inserções/edições.
 pub const DEFAULT_AVG_CHUNK: u32 = 64 * 1024;
 /// Versão do formato on-disk.
-pub const FORMAT_VERSION: u32 = 7;
+pub const FORMAT_VERSION: u32 = 8;
 /// Nível de compressão zstd padrão (1..=22; 3 é o equilíbrio do zstd).
 pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
@@ -159,6 +159,9 @@ pub struct Catalog {
     /// de caminhos de arquivos continuam implícitos.
     #[serde(default)]
     pub dirs: BTreeSet<String>,
+    /// Cota máxima de tamanho do `.vault` em bytes (None = sem limite).
+    #[serde(default)]
+    pub quota: Option<u64>,
 }
 
 /// Estado de criptografia de um container aberto (presente só se tem senha).
@@ -330,6 +333,18 @@ impl Vault {
     /// Ajusta o nível de compressão zstd para gravações subsequentes.
     pub fn set_zstd_level(&mut self, level: i32) {
         self.zstd_level = level;
+    }
+
+    /// Cota máxima do `.vault` em bytes (None = sem limite). Persiste no commit.
+    pub fn set_quota(&mut self, quota: Option<u64>) {
+        self.catalog.quota = quota;
+    }
+    pub fn quota(&self) -> Option<u64> {
+        self.catalog.quota
+    }
+    /// Tamanho atual ocupado no arquivo (bytes), para comparar com a cota.
+    pub fn used_bytes(&self) -> u64 {
+        self.next_append
     }
 
     fn key(&self) -> Option<&[u8; KEY_LEN]> {
@@ -574,6 +589,15 @@ impl Vault {
             return Ok(hash); // dedup: já existe, não regrava.
         }
         let stored = encode_block(data, self.zstd_level, self.key())?;
+        // Aplica a cota de tamanho (se houver), sobre a posição no arquivo.
+        if let Some(q) = self.catalog.quota {
+            if self.next_append + stored.len() as u64 > q {
+                bail!(
+                    "cota de tamanho do cofre excedida (limite {} bytes)",
+                    q
+                );
+            }
+        }
         let offset = self.next_append;
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(&stored)?;
@@ -1055,6 +1079,7 @@ impl Vault {
             files: self.catalog.files.clone(),
             snapshots: self.catalog.snapshots.clone(),
             dirs: self.catalog.dirs.clone(),
+            quota: self.catalog.quota,
         };
         let raw = bincode::serialize(&new_catalog).context("serializando catálogo")?;
         let bytes = match &self.enc {
@@ -1076,6 +1101,97 @@ impl Vault {
             bytes_before,
             bytes_after: next + bytes.len() as u64,
         })
+    }
+
+    /// Reescreve o container em `dest` com uma nova senha (ou sem senha, se
+    /// `new_password` for None), re-encriptando todos os blocos. O hash de
+    /// conteúdo é preservado (é do texto-claro), então dedup/snapshots continuam.
+    /// Use para DEFINIR, TROCAR ou REMOVER a senha do cofre.
+    pub fn rekey_to(&mut self, dest: impl AsRef<Path>, new_password: Option<&str>) -> Result<()> {
+        let dest = dest.as_ref();
+        if dest.exists() {
+            bail!("destino já existe: {}", dest.display());
+        }
+        // Novo estado de criptografia.
+        let new_enc = match new_password {
+            Some(pw) => {
+                let salt: [u8; SALT_LEN] = random_bytes();
+                let key = derive_key(pw, &salt)?;
+                let verify = seal(&key, VERIFY_PLAINTEXT)?;
+                Some(EncState { key, salt, verify })
+            }
+            None => None,
+        };
+        let new_key = new_enc.as_ref().map(|e| &e.key);
+
+        // Blocos alcançáveis (árvore + snapshots).
+        let mut reachable: HashSet<Hash> = HashSet::new();
+        for f in self.catalog.files.values() {
+            for cr in &f.chunks {
+                reachable.insert(cr.hash);
+            }
+        }
+        for snap in &self.catalog.snapshots {
+            for f in snap.files.values() {
+                for cr in &f.chunks {
+                    reachable.insert(cr.hash);
+                }
+            }
+        }
+
+        let mut newfile = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dest)
+            .with_context(|| format!("criando {}", dest.display()))?;
+        newfile.set_len(HEADER_SIZE)?;
+        let mut next = HEADER_SIZE;
+        let mut new_blocks: HashMap<Hash, BlockRef> = HashMap::new();
+
+        let block_hashes: Vec<Hash> = self.catalog.blocks.keys().copied().collect();
+        for hash in block_hashes {
+            if !reachable.contains(&hash) {
+                continue;
+            }
+            // Decodifica com a chave ATUAL, re-encoda com a NOVA.
+            self.ensure_block(&hash)?;
+            let plain = self.block_cache[&hash].clone();
+            let stored = encode_block(&plain, self.zstd_level, new_key)?;
+            newfile.seek(SeekFrom::Start(next))?;
+            newfile.write_all(&stored)?;
+            new_blocks.insert(
+                hash,
+                BlockRef {
+                    offset: next,
+                    len: stored.len() as u32,
+                    raw_len: plain.len() as u32,
+                },
+            );
+            next += stored.len() as u64;
+        }
+
+        let new_catalog = Catalog {
+            blocks: new_blocks,
+            files: self.catalog.files.clone(),
+            snapshots: self.catalog.snapshots.clone(),
+            dirs: self.catalog.dirs.clone(),
+            quota: self.catalog.quota,
+        };
+        let raw = bincode::serialize(&new_catalog).context("serializando catálogo")?;
+        let bytes = match &new_enc {
+            Some(e) => seal(&e.key, &raw).context("cifrando catálogo")?,
+            None => raw,
+        };
+        newfile.seek(SeekFrom::Start(next))?;
+        newfile.write_all(&bytes)?;
+        newfile.sync_data()?;
+
+        let header = build_header(self.chunk_size, next, bytes.len() as u64, new_enc.as_ref());
+        newfile.seek(SeekFrom::Start(0))?;
+        newfile.write_all(&header)?;
+        newfile.sync_all()?;
+        Ok(())
     }
 
     /// Persiste o catálogo no fim do arquivo e atualiza o header.
@@ -1115,6 +1231,8 @@ impl Vault {
             physical_bytes: physical,
             encrypted: self.enc.is_some(),
             snapshots: self.catalog.snapshots.len(),
+            quota: self.catalog.quota,
+            used_bytes: self.next_append,
         }
     }
 }
@@ -1131,6 +1249,10 @@ pub struct Stats {
     pub physical_bytes: u64,
     pub encrypted: bool,
     pub snapshots: usize,
+    /// Cota máxima do `.vault` em bytes (None = ilimitado).
+    pub quota: Option<u64>,
+    /// Tamanho atual do arquivo `.vault` (posição de append).
+    pub used_bytes: u64,
 }
 
 /// O que um caminho representa no sistema de arquivos lógico.
@@ -1438,6 +1560,49 @@ mod tests {
                 (x & 0xff) as u8
             })
             .collect()
+    }
+
+    #[test]
+    fn quota_and_rekey() {
+        let dir = tmp_dir("mng");
+        let vp = dir.join("m.vault");
+        let _ = std::fs::remove_file(&vp);
+        let mut v = Vault::create(&vp, DEFAULT_AVG_CHUNK).unwrap();
+
+        // Cota.
+        v.set_quota(Some(100_000));
+        assert_eq!(v.quota(), Some(100_000));
+
+        let small = dir.join("s.txt");
+        std::fs::write(&small, b"oi").unwrap();
+        v.add_file(&small, "s.txt").unwrap(); // cabe
+        v.commit().unwrap();
+
+        let big = dir.join("big.bin");
+        std::fs::write(&big, pseudo_random(1, 300_000)).unwrap();
+        assert!(v.add_file(&big, "big.bin").is_err()); // estoura a cota
+
+        // Rekey: DEFINIR senha.
+        let rk = dir.join("m2.vault");
+        v.rekey_to(&rk, Some("senha")).unwrap();
+        let mut v2 = Vault::open(&rk, Some("senha")).unwrap();
+        assert!(v2.is_encrypted());
+        assert_eq!(v2.quota(), Some(100_000)); // cota preservada
+        let mut out = Cursor::new(Vec::new());
+        v2.extract("s.txt", &mut out).unwrap();
+        assert_eq!(out.into_inner(), b"oi");
+        assert!(Vault::open(&rk, None).is_err()); // sem senha falha
+
+        // Rekey: REMOVER senha.
+        let rk2 = dir.join("m3.vault");
+        v2.rekey_to(&rk2, None).unwrap();
+        let mut v3 = Vault::open(&rk2, None).unwrap();
+        assert!(!v3.is_encrypted());
+        let mut out = Cursor::new(Vec::new());
+        v3.extract("s.txt", &mut out).unwrap();
+        assert_eq!(out.into_inner(), b"oi");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

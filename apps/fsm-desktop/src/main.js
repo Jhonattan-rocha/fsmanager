@@ -158,7 +158,7 @@ function renderStats(s) {
     ["Blocos únicos", s.unique_blocks],
     ["Snapshots", s.snapshots],
     ["Lógico", fmtBytes(s.logical_bytes)],
-    ["Em disco", fmtBytes(s.physical_bytes)],
+    ["Em uso", s.quota ? `${fmtBytes(s.used_bytes)} / ${fmtBytes(s.quota)}` : fmtBytes(s.used_bytes)],
     ["Dedup", fmtPct(s.dedup_savings)],
     ["Compressão", fmtPct(s.compression_savings)],
     ["Economia total", fmtPct(s.total_savings)],
@@ -200,6 +200,32 @@ function hideProgress() {
   $("progressLabel").textContent = "";
 }
 
+// ----------------------- gerenciar cofre -----------------------
+function updateManageSize(s) {
+  const used = (s && s.used_bytes) || 0;
+  const quota = s && s.quota;
+  if (quota) {
+    const pct = Math.min(100, Math.round((used / quota) * 100));
+    $("manageSize").textContent = `Usado ${fmtBytes(used)} de ${fmtBytes(quota)} (${pct}%)`;
+    $("usageBar").style.width = `${pct}%`;
+  } else {
+    $("manageSize").textContent = `Usado ${fmtBytes(used)} — sem limite`;
+    $("usageBar").style.width = "0%";
+  }
+}
+function openManage() {
+  const s = lastInfo && lastInfo.stats;
+  $("manageEncStatus").textContent = s && s.encrypted ? "🔒 Cofre cifrado (com senha)." : "🔓 Cofre sem senha.";
+  $("managePw").value = "";
+  $("manageQuota").value = s && s.quota ? Math.round(s.quota / (1024 * 1024)) : "";
+  $("manageError").textContent = "";
+  updateManageSize(s);
+  $("manageModal").classList.remove("hidden");
+}
+function closeManage() {
+  $("manageModal").classList.add("hidden");
+}
+
 // ----------------------- menu de contexto -----------------------
 function hideCtx() {
   $("ctxMenu").classList.add("hidden");
@@ -215,6 +241,66 @@ function showCtx(x, y, items) {
   el._items = items;
 }
 
+// ----------------------- edição inline (estilo Explorer) -----------------------
+function startInlineNew() {
+  const tbody = $("fileList");
+  const tr = document.createElement("tr");
+  tr.className = "editing-row";
+  tr.innerHTML = `<td class="name is-dir">📁 <input class="inline-edit" placeholder="nome da pasta" /></td><td class="num">—</td><td class="num">—</td><td></td>`;
+  tbody.prepend(tr);
+  const input = tr.querySelector("input");
+  input.focus();
+  let done = false;
+  const finish = async (save) => {
+    if (done) return;
+    done = true;
+    const nome = input.value.trim();
+    tr.remove();
+    if (save && nome) {
+      await guarded(async () => {
+        await call("make_dir", { path: joinPath(currentPath, nome) });
+        await refresh();
+        toast("pasta criada");
+      });
+    }
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") finish(true);
+    else if (e.key === "Escape") finish(false);
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
+function startInlineRename(tr, name) {
+  const cell = tr.querySelector("td.name");
+  const icon = cell.textContent.trim().charAt(0); // 📁 ou 📄 (1º caractere)
+  cell.innerHTML = `${icon} <input class="inline-edit" />`;
+  const input = cell.querySelector("input");
+  input.value = name;
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = async (save) => {
+    if (done) return;
+    done = true;
+    const novo = input.value.trim();
+    if (save && novo && novo !== name) {
+      await guarded(async () => {
+        await call("rename_path", { from: joinPath(currentPath, name), to: joinPath(currentPath, novo) });
+        await refresh();
+        toast("renomeado");
+      });
+    } else {
+      await refresh(); // restaura a célula
+    }
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") finish(true);
+    else if (e.key === "Escape") finish(false);
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
 // ----------------------- ações de entrada -----------------------
 function entryActions(name, isDir) {
   const full = joinPath(currentPath, name);
@@ -225,14 +311,10 @@ function entryActions(name, isDir) {
         const saved = await call("extract_file", { logical: full });
         if (saved) toast(`extraído para ${saved}`);
       }),
-    rename: () =>
-      guarded(async () => {
-        const novo = prompt("Novo nome:", name);
-        if (!novo || novo === name) return;
-        await call("rename_path", { from: full, to: joinPath(currentPath, novo) });
-        await refresh();
-        toast("renomeado");
-      }),
+    rename: () => {
+      const tr = [...$("fileList").querySelectorAll("tr[data-name]")].find((r) => r.dataset.name === name);
+      if (tr) startInlineRename(tr, name);
+    },
     remove: () =>
       guarded(async () => {
         const what = isDir ? `a pasta "${name}" e tudo dentro dela` : `"${name}"`;
@@ -272,7 +354,7 @@ window.addEventListener("DOMContentLoaded", () => {
       guarded(async () => {
         showProgress();
         try {
-          const n = await call("add_dropped", { paths, dest_dir: dest });
+          const n = await call("add_dropped", { paths, destDir: dest });
           await refresh();
           if (n > 0) toast(`${n} item(ns) adicionado(s)`);
         } finally {
@@ -315,7 +397,7 @@ window.addEventListener("DOMContentLoaded", () => {
       const dest = currentPath;
       showProgress();
       try {
-        const n = await call("add_files", { dest_dir: dest });
+        const n = await call("add_files", { destDir: dest });
         await refresh();
         if (n > 0) toast(`${n} arquivo(s) adicionado(s)`);
       } finally {
@@ -323,14 +405,46 @@ window.addEventListener("DOMContentLoaded", () => {
       }
     })
   );
-  $("btnNewFolder").addEventListener("click", () =>
+  $("btnNewFolder").addEventListener("click", () => {
+    if (vaultOpen) startInlineNew();
+  });
+
+  // --- gerenciar cofre ---
+  $("btnManage").addEventListener("click", () => {
+    if (vaultOpen) openManage();
+  });
+  $("manageClose").addEventListener("click", closeManage);
+  $("applyPw").addEventListener("click", () =>
     guarded(async () => {
-      const nome = prompt("Nome da nova pasta:");
-      if (!nome) return;
-      await call("make_dir", { path: joinPath(currentPath, nome) });
+      const pw = $("managePw").value;
+      toast(`⏳ ${pw ? "Aplicando senha" : "Removendo senha"}… re-encriptando o cofre`, false, true);
+      await call("change_password", { newPassword: pw || null });
       await refresh();
-      toast("pasta criada");
-    })
+      openManage();
+      toast(pw ? "senha definida" : "senha removida");
+    }, "manageError")
+  );
+  $("applyQuota").addEventListener("click", () =>
+    guarded(async () => {
+      const mb = parseFloat($("manageQuota").value);
+      if (!isFinite(mb) || mb <= 0) {
+        $("manageError").textContent = "informe um valor em MB maior que zero";
+        return;
+      }
+      await call("set_quota", { bytes: Math.round(mb * 1024 * 1024) });
+      await refresh();
+      updateManageSize(lastInfo.stats);
+      toast("limite aplicado");
+    }, "manageError")
+  );
+  $("clearQuota").addEventListener("click", () =>
+    guarded(async () => {
+      await call("set_quota", { bytes: null });
+      await refresh();
+      $("manageQuota").value = "";
+      updateManageSize(lastInfo.stats);
+      toast("limite removido");
+    }, "manageError")
   );
   $("btnGc").addEventListener("click", () =>
     guarded(async () => {

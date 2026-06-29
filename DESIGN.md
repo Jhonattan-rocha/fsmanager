@@ -68,9 +68,15 @@ uma geração — semente do versionamento.
 - [x] UI EXPLORADOR: navegação por PASTAS (`list_dir`/`make_dir`), breadcrumbs,
       arrastar-e-soltar para adicionar na pasta atual (eventos `tauri://drag-*`),
       barra de progresso visual (evento `add-progress` throttled), menu de
-      clique-direito (extrair/renomear/excluir), além de stats, snapshots e gc.
+      clique-direito (extrair/renomear/excluir), criação/renomeação INLINE (digita
+      o nome na própria árvore), além de stats, snapshots e gc.
       Comandos pesados são `#[command(async)]` (fora da thread da UI) e as crates
       de compressão/hash são otimizadas mesmo em `tauri dev` (profile overrides).
+      ⚠️ args de comando Tauri são camelCase no JS (Rust `dest_dir` → JS `destDir`).
+- [x] Gerenciamento do cofre: COTA de tamanho (`set_quota`/`quota`, enforce no
+      `write_block`) e SENHA (set/trocar/remover via `rekey_to` — reescreve
+      re-encriptando; hash de conteúdo preservado). UI: painel "⚙️ Gerenciar".
+      Formato v8 (campo `quota` no catálogo).
 - [x] Camada de leitura para mount no `fsm-core`: `read_range` (leitura aleatória
       decodificando só os chunks do intervalo), `resolve` e `list_dir` (árvore de
       diretórios derivada dos caminhos planos).

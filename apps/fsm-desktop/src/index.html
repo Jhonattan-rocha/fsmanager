@@ -43,6 +43,7 @@
         <div class="tools">
           <button id="btnAdd" class="primary">➕ Adicionar</button>
           <button id="btnNewFolder">📁 Nova pasta</button>
+          <button id="btnManage">⚙️ Gerenciar</button>
           <button id="btnMount">🔌 Montar</button>
           <button id="btnGc">🧹 Compactar</button>
           <button id="btnClose" class="ghost">✕ Fechar</button>
@@ -83,6 +84,43 @@
 
     <!-- Menu de contexto (clique direito) -->
     <div id="ctxMenu" class="ctx-menu hidden"></div>
+
+    <!-- Modal: gerenciar cofre -->
+    <div id="manageModal" class="modal hidden">
+      <div class="modal-card">
+        <div class="modal-head">
+          <h2>⚙️ Gerenciar cofre</h2>
+          <button id="manageClose" class="ghost small">✕</button>
+        </div>
+
+        <section class="manage-sec">
+          <h3>🔐 Senha</h3>
+          <p class="sub" id="manageEncStatus"></p>
+          <label class="field">
+            <span>Nova senha (deixe vazio para REMOVER a senha)</span>
+            <input id="managePw" type="password" placeholder="nova senha" />
+          </label>
+          <button id="applyPw" class="primary">Aplicar senha</button>
+          <p class="sub mini">Re-encripta todo o cofre — pode levar um tempo em cofres grandes.</p>
+        </section>
+
+        <section class="manage-sec">
+          <h3>📐 Tamanho</h3>
+          <p class="sub" id="manageSize"></p>
+          <div class="usage-track"><div class="usage-bar" id="usageBar"></div></div>
+          <label class="field">
+            <span>Limite em MB (vazio = sem limite)</span>
+            <input id="manageQuota" type="number" min="0" step="1" placeholder="ex: 1024" />
+          </label>
+          <div class="row">
+            <button id="applyQuota" class="primary">Aplicar limite</button>
+            <button id="clearQuota">Remover limite</button>
+          </div>
+        </section>
+
+        <p id="manageError" class="error"></p>
+      </div>
+    </div>
 
     <!-- Tela de drive montado -->
     <section id="mounted" class="welcome hidden">

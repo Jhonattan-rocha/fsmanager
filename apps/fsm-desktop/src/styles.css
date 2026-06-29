@@ -462,3 +462,69 @@ tbody tr {
 .ctx-menu button.danger:hover {
   background: var(--danger);
 }
+
+/* ---------- edição inline ---------- */
+.inline-edit {
+  padding: 2px 6px;
+  font-size: 13px;
+  width: 60%;
+  min-width: 160px;
+}
+.editing-row td {
+  background: var(--panel-2);
+}
+
+/* ---------- modal gerenciar ---------- */
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: grid;
+  place-items: center;
+  z-index: 80;
+}
+.modal-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  width: min(460px, 92vw);
+  max-height: 88vh;
+  overflow: auto;
+  padding: 22px 24px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+}
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.modal-head h2 {
+  margin: 0;
+  font-size: 18px;
+}
+.manage-sec {
+  border-top: 1px solid var(--border);
+  padding: 16px 0;
+}
+.manage-sec h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+.sub.mini {
+  font-size: 11px;
+  margin-top: 6px;
+}
+.usage-track {
+  height: 10px;
+  background: var(--panel-2);
+  border-radius: 6px;
+  overflow: hidden;
+  margin: 4px 0 12px;
+}
+.usage-bar {
+  height: 100%;
+  width: 0;
+  background: linear-gradient(90deg, var(--accent-2), var(--accent));
+  transition: width 0.15s ease;
+}
