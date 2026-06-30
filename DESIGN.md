@@ -105,11 +105,12 @@ uma geração — semente do versionamento.
       PERSISTÊNCIA (reabrir o .vault). Funciona com Explorer/PowerShell/apps.
       LIMITAÇÃO conhecida: builtins do cmd.exe (`copy`/`ren`/`del`) têm
       idiossincrasia com WinFsp e falham; operações diretas (CreateFile) funcionam.
-- [x] Mount FUSE/Linux READ-WRITE — módulo `unix` reescrito com estado mutável
-      (tabela de inodes dinâmica + buffers por arquivo). Implementa create/write/
-      mkdir/unlink/rmdir/rename/setattr(truncate)/flush/fsync/release, espelhando o
-      modelo do Windows. ESCRITO contra a API real do `fuser` 0.17, NÃO testado
-      (host Windows) — validar em Linux.
+- [x] Mount FUSE/Linux READ-WRITE — módulo `unix` com estado mutável (tabela de
+      inodes dinâmica + writers/buffers por inode). Implementa create/write/mkdir/
+      unlink/rmdir/rename/setattr(truncate)/flush/fsync/release. ESCRITA STREAMING
+      (StreamWriter por inode, como no Windows — não materializa arquivos grandes
+      na RAM) e leitura herda o `read_range` `&self`. ESCRITO contra a API do
+      `fuser` 0.17, NÃO compilado/testado (host Windows) — validar em Linux.
 - [x] Botão "Montar como drive" na UI (Tauri). Comando `mount_drive` FECHA o vault
       na UI e inicia o `fsm-mount` como PROCESSO separado (não linka — preserva a
       separação de licença: UI é o app, `fsm-mount` é GPLv3). `unmount_drive` mata o

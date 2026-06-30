@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use fsm_core::{NodeKind, Vault};
+use fsm_core::{NodeKind, StreamWriter, Vault};
 use fuser::{
     BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
     INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
@@ -34,6 +34,9 @@ struct Inner {
     ino_to_path: HashMap<u64, String>,
     path_to_ino: HashMap<String, u64>,
     next_ino: u64,
+    /// Escritores streaming por inode (create/escrita sequencial).
+    writers: HashMap<u64, StreamWriter>,
+    /// Buffers materializados por inode (escrita aleatória / após carregar).
     buffers: HashMap<u64, FileBuf>,
     open_count: HashMap<u64, u32>,
     uid: u32,
@@ -100,6 +103,7 @@ impl Inner {
             ino_to_path,
             path_to_ino,
             next_ino,
+            writers: HashMap::new(),
             buffers: HashMap::new(),
             open_count: HashMap::new(),
             uid,
@@ -124,6 +128,7 @@ impl Inner {
         if let Some(ino) = self.path_to_ino.remove(path) {
             self.ino_to_path.remove(&ino);
             self.buffers.remove(&ino);
+            self.writers.remove(&ino);
             self.open_count.remove(&ino);
         }
     }
@@ -174,8 +179,11 @@ impl Inner {
         }
     }
 
-    /// Atributos de um inode: prioriza o buffer materializado (tamanho atual).
+    /// Atributos de um inode: prioriza writer streaming / buffer (tamanho atual).
     fn attr_of(&self, ino: u64, path: &str) -> Option<FileAttr> {
+        if let Some(w) = self.writers.get(&ino) {
+            return Some(self.build_attr(ino, w.len(), now_secs(), FileType::RegularFile));
+        }
         if let Some(b) = self.buffers.get(&ino) {
             return Some(self.build_attr(ino, b.data.len() as u64, now_secs(), FileType::RegularFile));
         }
@@ -187,9 +195,15 @@ impl Inner {
         }
     }
 
-    /// Garante que o buffer do inode está carregado com o conteúdo atual.
+    /// Garante que o buffer do inode está materializado (converte o writer
+    /// streaming ou carrega do vault).
     fn ensure_buffer(&mut self, ino: u64, path: &str) {
         if self.buffers.contains_key(&ino) {
+            return;
+        }
+        if let Some(w) = self.writers.remove(&ino) {
+            let data = self.vault.writer_to_buffer(w).unwrap_or_default();
+            self.buffers.insert(ino, FileBuf { data, dirty: true });
             return;
         }
         let size = match self.vault.resolve(path) {
@@ -200,8 +214,12 @@ impl Inner {
         self.buffers.insert(ino, FileBuf { data, dirty: false });
     }
 
-    /// Persiste o buffer sujo no container.
+    /// Flush para fsync/flush: streaming NÃO é finalizado (defer p/ release);
+    /// buffer materializado sujo é gravado.
     fn flush_ino(&mut self, ino: u64) {
+        if self.writers.contains_key(&ino) {
+            return;
+        }
         let path = match self.ino_to_path.get(&ino) {
             Some(p) => p.clone(),
             None => return,
@@ -216,6 +234,22 @@ impl Inner {
                 }
             }
         }
+    }
+
+    /// Finaliza a escrita no fechamento (release): finaliza o writer streaming
+    /// OU grava o buffer materializado sujo.
+    fn finalize(&mut self, ino: u64) {
+        let path = match self.ino_to_path.get(&ino) {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        if let Some(w) = self.writers.remove(&ino) {
+            if self.vault.finish_write(w, &path, now_secs()).is_ok() {
+                let _ = self.vault.commit();
+            }
+            return;
+        }
+        self.flush_ino(ino);
     }
 }
 
@@ -280,8 +314,9 @@ impl Filesystem for FsmFuse {
         };
         if remaining == 0 {
             inner.open_count.remove(&ino);
-            inner.flush_ino(ino);
+            inner.finalize(ino);
             inner.buffers.remove(&ino);
+            inner.writers.remove(&ino);
         }
         reply.ok();
     }
@@ -303,6 +338,10 @@ impl Filesystem for FsmFuse {
             reply.error(Errno::ENOENT);
             return;
         };
+        // Leitura no meio de uma escrita streaming: materializa para servir.
+        if inner.writers.contains_key(&ino) {
+            inner.ensure_buffer(ino, &path);
+        }
         if let Some(b) = inner.buffers.get(&ino) {
             let from = (offset as usize).min(b.data.len());
             let to = (from + size as usize).min(b.data.len());
@@ -327,12 +366,22 @@ impl Filesystem for FsmFuse {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
         let ino = u64::from(ino);
         let Some(path) = inner.ino_to_path.get(&ino).cloned() else {
             reply.error(Errno::ENOENT);
             return;
         };
+        // STREAMING: chunka incrementalmente (fora de ordem cai para materializado).
+        if let Some(w) = inner.writers.get_mut(&ino) {
+            match inner.vault.stream_write(w, offset, data) {
+                Ok(()) => reply.written(data.len() as u32),
+                Err(_) => reply.error(Errno::EIO),
+            }
+            return;
+        }
+        // Materializado.
         inner.ensure_buffer(ino, &path);
         let end = offset as usize + data.len();
         let b = inner.buffers.get_mut(&ino).unwrap();
@@ -371,7 +420,9 @@ impl Filesystem for FsmFuse {
         }
         let _ = inner.vault.commit();
         let ino = inner.intern(&child);
-        inner.buffers.insert(ino, FileBuf { data: Vec::new(), dirty: false });
+        // Abre em modo STREAMING (escrita sequencial não materializa na RAM).
+        let w = inner.vault.stream_writer();
+        inner.writers.insert(ino, w);
         *inner.open_count.entry(ino).or_insert(0) += 1;
         let attr = inner.build_attr(ino, 0, now_secs(), FileType::RegularFile);
         reply.created(&TTL, &attr, Generation(0), FileHandle(0), FopenFlags::empty());
@@ -504,10 +555,15 @@ impl Filesystem for FsmFuse {
             return;
         };
         if let Some(sz) = size {
-            inner.ensure_buffer(ino, &path);
-            if let Some(b) = inner.buffers.get_mut(&ino) {
-                b.data.resize(sz as usize, 0);
-                b.dirty = true;
+            // Em streaming, ignora extensão/preallocação (sz >= já escrito);
+            // só truncar de verdade força materializar.
+            let keep_streaming = inner.writers.get(&ino).map(|w| sz >= w.len()).unwrap_or(false);
+            if !keep_streaming {
+                inner.ensure_buffer(ino, &path);
+                if let Some(b) = inner.buffers.get_mut(&ino) {
+                    b.data.resize(sz as usize, 0);
+                    b.dirty = true;
+                }
             }
         }
         match inner.attr_of(ino, &path) {
