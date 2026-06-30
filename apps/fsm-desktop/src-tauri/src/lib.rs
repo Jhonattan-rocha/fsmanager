@@ -451,6 +451,30 @@ fn change_password(
     Ok(())
 }
 
+#[derive(Serialize)]
+struct VerifyDto {
+    healthy: bool,
+    blocks_ok: usize,
+    blocks_bad: usize,
+    missing_blocks: usize,
+    errors: Vec<String>,
+}
+
+/// Verifica a integridade do cofre (hash de cada bloco).
+#[tauri::command(async)]
+fn verify_vault(state: State<AppState>) -> Result<VerifyDto, String> {
+    with_vault(&state, |v| {
+        let r = v.verify().map_err(s)?;
+        Ok(VerifyDto {
+            healthy: r.is_healthy(),
+            blocks_ok: r.blocks_ok,
+            blocks_bad: r.blocks_bad,
+            missing_blocks: r.missing_blocks,
+            errors: r.errors.into_iter().take(20).collect(),
+        })
+    })
+}
+
 /// Localiza o binário `fsm-mount` (env `FSM_MOUNT_BIN`, ao lado do exe, ou alvos de dev).
 fn resolve_mount_bin() -> Result<std::path::PathBuf, String> {
     let name = if cfg!(windows) {
@@ -571,6 +595,7 @@ pub fn run() {
             gc_vault,
             set_quota,
             change_password,
+            verify_vault,
             mount_drive,
             unmount_drive,
             mount_status,

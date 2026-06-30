@@ -1017,6 +1017,59 @@ impl Vault {
         Ok(self.catalog.snapshots.len() != before)
     }
 
+    /// Verifica a integridade do container: lê e decodifica cada bloco único,
+    /// confere o endereço de conteúdo (BLAKE3), e checa se todos os chunks
+    /// referenciados existem. Não usa o cache (testa os bytes em disco).
+    pub fn verify(&mut self) -> Result<VerifyReport> {
+        let mut report = VerifyReport::default();
+        const MAX_ERRORS: usize = 100;
+
+        let hashes: Vec<Hash> = self.catalog.blocks.keys().copied().collect();
+        for hash in hashes {
+            let bref = self.catalog.blocks[&hash];
+            let mut buf = vec![0u8; bref.len as usize];
+            self.file.seek(SeekFrom::Start(bref.offset))?;
+            if self.file.read_exact(&mut buf).is_err() {
+                report.blocks_bad += 1;
+                if report.errors.len() < MAX_ERRORS {
+                    report.errors.push("bloco ilegível (leitura falhou)".to_string());
+                }
+                continue;
+            }
+            match decode_block(&buf, self.key()) {
+                Ok(data) => {
+                    if blake3::hash(&data).as_bytes() == &hash {
+                        report.blocks_ok += 1;
+                    } else {
+                        report.blocks_bad += 1;
+                        if report.errors.len() < MAX_ERRORS {
+                            report.errors.push("bloco com conteúdo corrompido (hash não bate)".to_string());
+                        }
+                    }
+                }
+                Err(_) => {
+                    report.blocks_bad += 1;
+                    if report.errors.len() < MAX_ERRORS {
+                        report.errors.push("bloco não decodifica (corrompido ou senha errada)".to_string());
+                    }
+                }
+            }
+        }
+
+        // Chunks que apontam para blocos inexistentes.
+        for (path, entry) in &self.catalog.files {
+            for cr in &entry.chunks {
+                if !self.catalog.blocks.contains_key(&cr.hash) {
+                    report.missing_blocks += 1;
+                    if report.errors.len() < MAX_ERRORS {
+                        report.errors.push(format!("{path}: referência a bloco ausente"));
+                    }
+                }
+            }
+        }
+        Ok(report)
+    }
+
     /// Reescreve o container em `dest` mantendo só os blocos alcançáveis pelos
     /// arquivos atuais — recupera espaço de removidos e de gerações antigas.
     /// Preserva a criptografia (mesma chave/salt) para a mesma senha continuar valendo.
@@ -1267,6 +1320,25 @@ pub struct DirEntry {
     pub is_dir: bool,
     pub size: u64,
     pub mtime: i64,
+}
+
+/// Resultado de uma verificação de integridade ([`Vault::verify`]).
+#[derive(Default)]
+pub struct VerifyReport {
+    /// Blocos únicos lidos e decodificados com sucesso.
+    pub blocks_ok: usize,
+    /// Blocos que falharam (não leem, não decodificam, ou hash não bate).
+    pub blocks_bad: usize,
+    /// Referências de chunk para blocos ausentes no índice.
+    pub missing_blocks: usize,
+    /// Descrições dos problemas encontrados (limitado).
+    pub errors: Vec<String>,
+}
+
+impl VerifyReport {
+    pub fn is_healthy(&self) -> bool {
+        self.blocks_bad == 0 && self.missing_blocks == 0
+    }
 }
 
 /// Resultado de uma compactação ([`Vault::compact_to`]).
@@ -1560,6 +1632,37 @@ mod tests {
                 (x & 0xff) as u8
             })
             .collect()
+    }
+
+    #[test]
+    fn verify_detects_corruption() {
+        let dir = tmp_dir("verify");
+        let vp = dir.join("v.vault");
+        let _ = std::fs::remove_file(&vp);
+        let mut v = Vault::create(&vp, DEFAULT_AVG_CHUNK).unwrap();
+        let f = dir.join("a.bin");
+        std::fs::write(&f, pseudo_random(7, 100_000)).unwrap();
+        v.add_file(&f, "a.bin").unwrap();
+        v.commit().unwrap();
+
+        let rep = v.verify().unwrap();
+        assert!(rep.is_healthy());
+        assert!(rep.blocks_ok > 0 && rep.blocks_bad == 0);
+        drop(v);
+
+        // Corrompe bytes na região de dados (após o header de 4 KiB).
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = std::fs::OpenOptions::new().write(true).open(&vp).unwrap();
+            file.seek(SeekFrom::Start(5000)).unwrap();
+            file.write_all(&[0xFF; 128]).unwrap();
+        }
+        let mut v2 = Vault::open(&vp, None).unwrap();
+        let rep2 = v2.verify().unwrap();
+        assert!(!rep2.is_healthy());
+        assert!(rep2.blocks_bad > 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

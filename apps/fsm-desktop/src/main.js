@@ -446,6 +446,22 @@ window.addEventListener("DOMContentLoaded", () => {
       toast("limite removido");
     }, "manageError")
   );
+  $("verifyBtn").addEventListener("click", () =>
+    guarded(async () => {
+      const out = $("verifyResult");
+      out.className = "sub";
+      out.textContent = "⏳ verificando todos os blocos…";
+      const r = await call("verify_vault");
+      if (r.healthy) {
+        out.className = "sub ok";
+        out.textContent = `✓ íntegro — ${r.blocks_ok} blocos verificados`;
+      } else {
+        out.className = "sub error";
+        const det = r.errors.slice(0, 3).join("; ");
+        out.textContent = `✗ ${r.blocks_bad} ruim(ns), ${r.missing_blocks} ausente(s)${det ? " — " + det : ""}`;
+      }
+    }, "manageError")
+  );
   $("btnGc").addEventListener("click", () =>
     guarded(async () => {
       toast("⏳ Compactando…", false, true);

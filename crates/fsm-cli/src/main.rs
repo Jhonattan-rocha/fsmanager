@@ -104,6 +104,12 @@ enum Cmd {
         #[command(subcommand)]
         action: SnapAction,
     },
+    /// Verifica a integridade do container (hash de cada bloco).
+    Verify {
+        vault: PathBuf,
+        #[arg(long, short = 'p')]
+        password: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -314,6 +320,23 @@ fn main() -> Result<()> {
                         anyhow::bail!("snapshot não encontrado: {name}");
                     }
                 }
+            }
+        }
+        Cmd::Verify { vault, password } => {
+            let pw = resolve_pw(password);
+            let mut v = Vault::open(&vault, pw.as_deref())?;
+            let r = v.verify()?;
+            println!("blocos OK:        {}", r.blocks_ok);
+            println!("blocos ruins:     {}", r.blocks_bad);
+            println!("blocos ausentes:  {}", r.missing_blocks);
+            if r.is_healthy() {
+                println!("\n✓ íntegro");
+            } else {
+                println!("\n✗ PROBLEMAS encontrados:");
+                for e in r.errors.iter().take(20) {
+                    println!("  - {e}");
+                }
+                std::process::exit(1);
             }
         }
     }

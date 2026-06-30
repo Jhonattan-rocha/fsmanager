@@ -77,6 +77,10 @@ uma geração — semente do versionamento.
       `write_block`) e SENHA (set/trocar/remover via `rekey_to` — reescreve
       re-encriptando; hash de conteúdo preservado). UI: painel "⚙️ Gerenciar".
       Formato v8 (campo `quota` no catálogo).
+- [x] Verificação de integridade: `Vault::verify` lê e confere o BLAKE3 de cada
+      bloco (e chunks órfãos), sem usar o cache. Exposto em `fsm verify` (CLI,
+      exit≠0 se corrompido) e no painel "⚙️ Gerenciar → 🛡️ Integridade" da UI.
+      Restaura sob demanda a garantia que tiramos do caminho de leitura por perf.
 - [x] Camada de leitura para mount no `fsm-core`: `read_range` (leitura aleatória
       decodificando só os chunks do intervalo), `resolve` e `list_dir` (árvore de
       diretórios derivada dos caminhos planos).

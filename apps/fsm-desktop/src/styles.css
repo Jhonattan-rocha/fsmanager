@@ -515,6 +515,12 @@ tbody tr {
   font-size: 11px;
   margin-top: 6px;
 }
+.sub.ok {
+  color: var(--ok);
+}
+.sub.error {
+  color: var(--danger);
+}
 .usage-track {
   height: 10px;
   background: var(--panel-2);
