@@ -60,6 +60,7 @@ fsm snapshot meu.vault create v1
 fsm stats meu.vault
 fsm gc meu.vault                   # compacta
 fsm verify meu.vault               # checa integridade (exit≠0 se corrompido)
+fsm repair meu.vault               # repara: trunca/remove arquivos danificados
 ```
 
 ## Montar como drive (CLI)

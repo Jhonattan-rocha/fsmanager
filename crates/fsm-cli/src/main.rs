@@ -110,6 +110,12 @@ enum Cmd {
         #[arg(long, short = 'p')]
         password: Option<String>,
     },
+    /// Repara: trunca arquivos com blocos corrompidos e recupera o íntegro.
+    Repair {
+        vault: PathBuf,
+        #[arg(long, short = 'p')]
+        password: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -337,6 +343,24 @@ fn main() -> Result<()> {
                     println!("  - {e}");
                 }
                 std::process::exit(1);
+            }
+        }
+        Cmd::Repair { vault, password } => {
+            let pw = resolve_pw(password);
+            let mut v = Vault::open(&vault, pw.as_deref())?;
+            let r = v.repair()?;
+            v.commit()?;
+            if r.files_damaged == 0 {
+                println!("✓ nada a reparar — cofre íntegro");
+            } else {
+                println!("{} arquivo(s) danificado(s):", r.files_damaged);
+                for (p, sz) in &r.truncated {
+                    println!("  truncado: {p} -> {sz} bytes");
+                }
+                for p in &r.removed {
+                    println!("  removido: {p}");
+                }
+                println!("\nrode 'gc' para liberar o espaço dos blocos descartados.");
             }
         }
     }

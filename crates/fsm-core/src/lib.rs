@@ -32,6 +32,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -186,14 +187,85 @@ pub struct Vault {
     enc: Option<EncState>,
     /// Cache de blocos já decodificados (descomprimidos/decifrados), por hash.
     /// Blocos são imutáveis (content-addressed), então nunca ficam obsoletos.
-    block_cache: HashMap<Hash, Vec<u8>>,
-    cache_order: VecDeque<Hash>,
-    cache_bytes: usize,
-    cache_cap: usize,
+    /// `Mutex` para permitir leitura compartilhada (`&self`) e paralela.
+    cache: Mutex<BlockCache>,
 }
 
 /// Capacidade padrão do cache de blocos decodificados (128 MiB).
 const DEFAULT_CACHE_CAP: usize = 128 << 20;
+
+/// Cache LRU (FIFO) de blocos decodificados. Guarda `Arc` para clonar barato
+/// fora do lock.
+struct BlockCache {
+    map: HashMap<Hash, Arc<Vec<u8>>>,
+    order: VecDeque<Hash>,
+    bytes: usize,
+    cap: usize,
+}
+
+impl BlockCache {
+    fn new(cap: usize) -> Self {
+        BlockCache {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            cap,
+        }
+    }
+    fn get(&self, hash: &Hash) -> Option<Arc<Vec<u8>>> {
+        self.map.get(hash).cloned()
+    }
+    fn put(&mut self, hash: Hash, data: Arc<Vec<u8>>) {
+        let n = data.len();
+        if n > self.cap || self.map.contains_key(&hash) {
+            return;
+        }
+        self.bytes += n;
+        self.map.insert(hash, data);
+        self.order.push_back(hash);
+        while self.bytes > self.cap {
+            match self.order.pop_front() {
+                Some(old) => {
+                    if let Some(v) = self.map.remove(&old) {
+                        self.bytes -= v.len();
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+/// Lê exatamente `buf.len()` bytes de `file` a partir de `offset`, SEM mexer na
+/// posição do arquivo (leitura posicionada) — permite leituras concorrentes.
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "fim de arquivo inesperado",
+                ));
+            }
+            done += n;
+        }
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = (file, buf, offset);
+        unimplemented!("plataforma sem leitura posicionada")
+    }
+}
 
 impl Vault {
     /// Cria um container novo e vazio, **sem** criptografia.
@@ -237,10 +309,7 @@ impl Vault {
             next_append: HEADER_SIZE,
             zstd_level: DEFAULT_ZSTD_LEVEL,
             enc,
-            block_cache: HashMap::new(),
-            cache_order: VecDeque::new(),
-            cache_bytes: 0,
-            cache_cap: DEFAULT_CACHE_CAP,
+            cache: Mutex::new(BlockCache::new(DEFAULT_CACHE_CAP)),
         };
         vault.file.set_len(HEADER_SIZE)?;
         vault.commit()?;
@@ -314,10 +383,7 @@ impl Vault {
             next_append: catalog_offset + catalog_len,
             zstd_level: DEFAULT_ZSTD_LEVEL,
             enc,
-            block_cache: HashMap::new(),
-            cache_order: VecDeque::new(),
-            cache_bytes: 0,
-            cache_cap: DEFAULT_CACHE_CAP,
+            cache: Mutex::new(BlockCache::new(DEFAULT_CACHE_CAP)),
         })
     }
 
@@ -516,21 +582,21 @@ impl Vault {
     }
 
     /// Conteúdo completo atual de um writer (chunks emitidos + cauda).
-    fn writer_content(&mut self, w: &StreamWriter) -> Result<Vec<u8>> {
+    fn writer_content(&self, w: &StreamWriter) -> Result<Vec<u8>> {
         if let Some(buf) = &w.fallback {
             return Ok(buf.clone());
         }
         let mut buf = Vec::with_capacity(w.size as usize);
         for cr in &w.chunks {
-            self.ensure_block(&cr.hash)?;
-            buf.extend_from_slice(&self.block_cache[&cr.hash]);
+            let data = self.get_block(&cr.hash)?;
+            buf.extend_from_slice(&data);
         }
         buf.extend_from_slice(&w.pending);
         Ok(buf)
     }
 
     /// Materializa um writer num buffer (para servir leituras no meio da escrita).
-    pub fn writer_to_buffer(&mut self, w: StreamWriter) -> Result<Vec<u8>> {
+    pub fn writer_to_buffer(&self, w: StreamWriter) -> Result<Vec<u8>> {
         self.writer_content(&w)
     }
 
@@ -613,10 +679,11 @@ impl Vault {
         Ok(hash)
     }
 
-    /// Garante que o bloco `hash` está no cache decodificado (lê+decodifica se preciso).
-    fn ensure_block(&mut self, hash: &Hash) -> Result<()> {
-        if self.block_cache.contains_key(hash) {
-            return Ok(());
+    /// Devolve o conteúdo decodificado de um bloco (do cache, ou lendo+decodificando).
+    /// `&self` com leitura posicionada e cache com `Mutex` — seguro e paralelo.
+    fn get_block(&self, hash: &Hash) -> Result<Arc<Vec<u8>>> {
+        if let Some(arc) = self.cache.lock().unwrap().get(hash) {
+            return Ok(arc);
         }
         let bref = *self
             .catalog
@@ -624,23 +691,85 @@ impl Vault {
             .get(hash)
             .context("bloco referenciado ausente (container corrompido)")?;
         let mut buf = vec![0u8; bref.len as usize];
-        self.file.seek(SeekFrom::Start(bref.offset))?;
-        self.file.read_exact(&mut buf)?;
-        // Sem re-verificar BLAKE3 aqui: o bloco é buscado PELO endereço de
-        // conteúdo (logo é o conteúdo certo por construção) e, se cifrado, o
-        // Poly1305 já autentica. Isso acelera muito a leitura no mount.
-        let data = decode_block(&buf, self.key())?;
-        self.cache_put(*hash, data);
-        Ok(())
+        read_exact_at(&self.file, &mut buf, bref.offset)?;
+        // Sem re-verificar BLAKE3 (busca-se PELO hash; cifrados têm Poly1305).
+        let data = Arc::new(decode_block(&buf, self.key())?);
+        self.cache.lock().unwrap().put(*hash, data.clone());
+        Ok(data)
     }
 
-    /// Decodifica os blocos `hashes` ainda não em cache, lendo do `.vault` em
-    /// lotes: runs de blocos fisicamente contíguos são lidos numa única syscall.
-    fn prefetch_blocks(&mut self, hashes: &[Hash]) -> Result<()> {
+    /// Lê um arquivo lógico e escreve seu conteúdo em `out`.
+    pub fn extract<W: Write>(&self, logical: &str, out: &mut W) -> Result<u64> {
+        let logical = normalize_path(logical);
+        let entry = self
+            .catalog
+            .files
+            .get(&logical)
+            .with_context(|| format!("arquivo não encontrado: {logical}"))?
+            .clone();
+
+        let mut written = 0u64;
+        for cr in &entry.chunks {
+            let data = self.get_block(&cr.hash)?;
+            out.write_all(&data)?;
+            written += data.len() as u64;
+        }
+        Ok(written)
+    }
+
+    /// Lê `len` bytes de um arquivo lógico a partir de `offset`. `&self`: permite
+    /// leituras paralelas (leitura posicionada + cache com Mutex).
+    pub fn read_range(&self, logical: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let logical = normalize_path(logical);
+        let entry = self
+            .catalog
+            .files
+            .get(&logical)
+            .with_context(|| format!("arquivo não encontrado: {logical}"))?
+            .clone();
+        if offset >= entry.size || len == 0 {
+            return Ok(Vec::new());
+        }
+        let end = (offset + len as u64).min(entry.size);
+
+        // 1) Chunks que tocam o intervalo.
+        let mut needed: Vec<(Hash, u64)> = Vec::new();
+        let mut pos: u64 = 0;
+        for cr in &entry.chunks {
+            let chunk_start = pos;
+            let chunk_end = pos + cr.len as u64;
+            pos = chunk_end;
+            if chunk_end <= offset {
+                continue;
+            }
+            if chunk_start >= end {
+                break;
+            }
+            needed.push((cr.hash, chunk_start));
+        }
+
+        // 2) Aquece o cache coalescendo IO de blocos contíguos (1 leitura por run).
+        self.prefetch(&needed)?;
+
+        // 3) Monta a saída a partir do cache (get_block re-lê se algo foi despejado).
+        let mut out = Vec::with_capacity((end - offset) as usize);
+        for (hash, chunk_start) in needed {
+            let data = self.get_block(&hash)?;
+            let from = offset.saturating_sub(chunk_start) as usize;
+            let to = ((end - chunk_start) as usize).min(data.len());
+            out.extend_from_slice(&data[from..to]);
+        }
+        Ok(out)
+    }
+
+    /// Decodifica os blocos `needed` ainda não em cache, lendo do `.vault` em
+    /// lotes: runs fisicamente contíguos são lidos numa única leitura posicionada.
+    fn prefetch(&self, needed: &[(Hash, u64)]) -> Result<()> {
+        let cached = |h: &Hash| self.cache.lock().unwrap().get(h).is_some();
         let mut i = 0;
-        while i < hashes.len() {
-            let h = hashes[i];
-            if self.block_cache.contains_key(&h) {
+        while i < needed.len() {
+            let h = needed[i].0;
+            if cached(&h) {
                 i += 1;
                 continue;
             }
@@ -652,11 +781,10 @@ impl Vault {
             let run_start = first.offset;
             let mut run_end = first.offset + first.len as u64;
             let mut run: Vec<(Hash, BlockRef)> = vec![(h, first)];
-            // Estende o run enquanto os próximos blocos forem contíguos no arquivo.
             let mut j = i + 1;
-            while j < hashes.len() {
-                let h2 = hashes[j];
-                if self.block_cache.contains_key(&h2) {
+            while j < needed.len() {
+                let h2 = needed[j].0;
+                if cached(&h2) {
                     break;
                 }
                 let b2 = *self
@@ -672,105 +800,16 @@ impl Vault {
                     break;
                 }
             }
-            // Uma única leitura para o run inteiro.
             let mut buf = vec![0u8; (run_end - run_start) as usize];
-            self.file.seek(SeekFrom::Start(run_start))?;
-            self.file.read_exact(&mut buf)?;
+            read_exact_at(&self.file, &mut buf, run_start)?;
             for (bh, br) in run {
                 let rel = (br.offset - run_start) as usize;
-                let data = decode_block(&buf[rel..rel + br.len as usize], self.key())?;
-                self.cache_put(bh, data);
+                let data = Arc::new(decode_block(&buf[rel..rel + br.len as usize], self.key())?);
+                self.cache.lock().unwrap().put(bh, data);
             }
             i = j;
         }
         Ok(())
-    }
-
-    /// Insere um bloco decodificado no cache, com despejo FIFO por tamanho.
-    fn cache_put(&mut self, hash: Hash, data: Vec<u8>) {
-        let n = data.len();
-        if n > self.cache_cap || self.block_cache.contains_key(&hash) {
-            return;
-        }
-        self.cache_bytes += n;
-        self.block_cache.insert(hash, data);
-        self.cache_order.push_back(hash);
-        while self.cache_bytes > self.cache_cap {
-            match self.cache_order.pop_front() {
-                Some(old) => {
-                    if let Some(v) = self.block_cache.remove(&old) {
-                        self.cache_bytes -= v.len();
-                    }
-                }
-                None => break,
-            }
-        }
-    }
-
-    /// Lê um arquivo lógico e escreve seu conteúdo em `out`.
-    pub fn extract<W: Write>(&mut self, logical: &str, out: &mut W) -> Result<u64> {
-        let logical = normalize_path(logical);
-        let entry = self
-            .catalog
-            .files
-            .get(&logical)
-            .with_context(|| format!("arquivo não encontrado: {logical}"))?
-            .clone();
-
-        let mut written = 0u64;
-        for cr in &entry.chunks {
-            self.ensure_block(&cr.hash)?;
-            let data = &self.block_cache[&cr.hash];
-            out.write_all(data)?;
-            written += data.len() as u64;
-        }
-        Ok(written)
-    }
-
-    /// Lê `len` bytes de um arquivo lógico a partir de `offset`, decodificando
-    /// apenas os chunks que tocam o intervalo. Base para o mount (leitura aleatória).
-    pub fn read_range(&mut self, logical: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
-        let logical = normalize_path(logical);
-        let entry = self
-            .catalog
-            .files
-            .get(&logical)
-            .with_context(|| format!("arquivo não encontrado: {logical}"))?
-            .clone();
-        if offset >= entry.size || len == 0 {
-            return Ok(Vec::new());
-        }
-        let end = (offset + len as u64).min(entry.size);
-
-        // 1) Coleta os chunks que tocam o intervalo (hash + offset lógico do chunk).
-        let mut needed: Vec<(Hash, u64)> = Vec::new();
-        let mut pos: u64 = 0;
-        for cr in &entry.chunks {
-            let chunk_start = pos;
-            let chunk_end = pos + cr.len as u64; // tamanho inline: sem lookup
-            pos = chunk_end;
-            if chunk_end <= offset {
-                continue;
-            }
-            if chunk_start >= end {
-                break;
-            }
-            needed.push((cr.hash, chunk_start));
-        }
-
-        // 2) Decodifica em lote, coalescendo IO de blocos contíguos no .vault.
-        let hashes: Vec<Hash> = needed.iter().map(|(h, _)| *h).collect();
-        self.prefetch_blocks(&hashes)?;
-
-        // 3) Copia os pedaços do cache decodificado.
-        let mut out = Vec::with_capacity((end - offset) as usize);
-        for (hash, chunk_start) in needed {
-            let data = &self.block_cache[&hash];
-            let from = offset.saturating_sub(chunk_start) as usize;
-            let to = ((end - chunk_start) as usize).min(data.len());
-            out.extend_from_slice(&data[from..to]);
-        }
-        Ok(out)
     }
 
     /// Resolve um caminho para diretório, arquivo ou inexistente (para `lookup`/`getattr`).
@@ -1020,7 +1059,7 @@ impl Vault {
     /// Verifica a integridade do container: lê e decodifica cada bloco único,
     /// confere o endereço de conteúdo (BLAKE3), e checa se todos os chunks
     /// referenciados existem. Não usa o cache (testa os bytes em disco).
-    pub fn verify(&mut self) -> Result<VerifyReport> {
+    pub fn verify(&self) -> Result<VerifyReport> {
         let mut report = VerifyReport::default();
         const MAX_ERRORS: usize = 100;
 
@@ -1028,8 +1067,7 @@ impl Vault {
         for hash in hashes {
             let bref = self.catalog.blocks[&hash];
             let mut buf = vec![0u8; bref.len as usize];
-            self.file.seek(SeekFrom::Start(bref.offset))?;
-            if self.file.read_exact(&mut buf).is_err() {
+            if read_exact_at(&self.file, &mut buf, bref.offset).is_err() {
                 report.blocks_bad += 1;
                 if report.errors.len() < MAX_ERRORS {
                     report.errors.push("bloco ilegível (leitura falhou)".to_string());
@@ -1065,6 +1103,73 @@ impl Vault {
                         report.errors.push(format!("{path}: referência a bloco ausente"));
                     }
                 }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Verifica se um bloco existe, lê e decodifica, e o hash bate.
+    fn block_is_valid(&self, hash: &Hash) -> bool {
+        let Some(bref) = self.catalog.blocks.get(hash).copied() else {
+            return false;
+        };
+        let mut buf = vec![0u8; bref.len as usize];
+        if read_exact_at(&self.file, &mut buf, bref.offset).is_err() {
+            return false;
+        }
+        match decode_block(&buf, self.key()) {
+            Ok(data) => blake3::hash(&data).as_bytes() == hash,
+            Err(_) => false,
+        }
+    }
+
+    /// Repara o container: para cada arquivo, mantém o prefixo de chunks íntegros
+    /// e descarta a partir do primeiro bloco ruim/ausente (trunca). Arquivos sem
+    /// nenhum chunk salvável são removidos. Chame [`commit`] depois (e `gc` para
+    /// recuperar espaço). NÃO recupera o dado corrompido — só deixa o cofre
+    /// consistente e salva o que dá.
+    pub fn repair(&mut self) -> Result<RepairReport> {
+        let mut report = RepairReport::default();
+
+        // 1) Identifica blocos inválidos e remove do índice.
+        let block_hashes: Vec<Hash> = self.catalog.blocks.keys().copied().collect();
+        let mut bad: HashSet<Hash> = HashSet::new();
+        for h in block_hashes {
+            if !self.block_is_valid(&h) {
+                bad.insert(h);
+            }
+        }
+        for h in &bad {
+            self.catalog.blocks.remove(h);
+        }
+
+        // 2) Trunca cada arquivo no primeiro chunk que referencia bloco ruim/ausente.
+        let paths: Vec<String> = self.catalog.files.keys().cloned().collect();
+        for path in paths {
+            let entry = self.catalog.files[&path].clone();
+            let mut good: Vec<ChunkRef> = Vec::new();
+            let mut good_len = 0u64;
+            let mut damaged = false;
+            for cr in &entry.chunks {
+                if bad.contains(&cr.hash) || !self.catalog.blocks.contains_key(&cr.hash) {
+                    damaged = true;
+                    break;
+                }
+                good.push(*cr);
+                good_len += cr.len as u64;
+            }
+            if !damaged {
+                continue;
+            }
+            report.files_damaged += 1;
+            if good.is_empty() {
+                self.catalog.files.remove(&path);
+                report.removed.push(path);
+            } else {
+                let e = self.catalog.files.get_mut(&path).unwrap();
+                e.chunks = good;
+                e.size = good_len;
+                report.truncated.push((path, good_len));
             }
         }
         Ok(report)
@@ -1208,8 +1313,7 @@ impl Vault {
                 continue;
             }
             // Decodifica com a chave ATUAL, re-encoda com a NOVA.
-            self.ensure_block(&hash)?;
-            let plain = self.block_cache[&hash].clone();
+            let plain = self.get_block(&hash)?;
             let stored = encode_block(&plain, self.zstd_level, new_key)?;
             newfile.seek(SeekFrom::Start(next))?;
             newfile.write_all(&stored)?;
@@ -1339,6 +1443,17 @@ impl VerifyReport {
     pub fn is_healthy(&self) -> bool {
         self.blocks_bad == 0 && self.missing_blocks == 0
     }
+}
+
+/// Resultado de um reparo ([`Vault::repair`]).
+#[derive(Default)]
+pub struct RepairReport {
+    /// Arquivos que tinham algum bloco ruim/ausente.
+    pub files_damaged: usize,
+    /// Arquivos removidos (nada salvável).
+    pub removed: Vec<String>,
+    /// Arquivos truncados no prefixo íntegro: (caminho, novo tamanho).
+    pub truncated: Vec<(String, u64)>,
 }
 
 /// Resultado de uma compactação ([`Vault::compact_to`]).
@@ -1661,6 +1776,46 @@ mod tests {
         let rep2 = v2.verify().unwrap();
         assert!(!rep2.is_healthy());
         assert!(rep2.blocks_bad > 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repair_truncates_then_verifies_clean() {
+        let dir = tmp_dir("repair");
+        let vp = dir.join("r.vault");
+        let _ = std::fs::remove_file(&vp);
+        let mut v = Vault::create(&vp, DEFAULT_AVG_CHUNK).unwrap();
+        let data = pseudo_random(11, 300_000);
+        let f = dir.join("a.bin");
+        std::fs::write(&f, &data).unwrap();
+        v.add_file(&f, "a.bin").unwrap();
+        v.commit().unwrap();
+        assert!(v.catalog().files["/a.bin"].chunks.len() >= 3);
+        drop(v);
+
+        // Corrompe um chunk depois do início (offset bem dentro da região de dados).
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = std::fs::OpenOptions::new().write(true).open(&vp).unwrap();
+            file.seek(SeekFrom::Start(4096 + 90_000)).unwrap();
+            file.write_all(&[0xAA; 512]).unwrap();
+        }
+        let mut v2 = Vault::open(&vp, None).unwrap();
+        assert!(!v2.verify().unwrap().is_healthy());
+
+        let rep = v2.repair().unwrap();
+        assert_eq!(rep.files_damaged, 1);
+        v2.commit().unwrap();
+
+        // Após reparar: verify limpo e o arquivo está truncado (ou removido).
+        assert!(v2.verify().unwrap().is_healthy());
+        if let Some(e) = v2.catalog().files.get("/a.bin") {
+            assert!(e.size < data.len() as u64);
+            // O prefixo salvo bate com o original.
+            let got = v2.read_range("/a.bin", 0, e.size as usize).unwrap();
+            assert_eq!(got, &data[..e.size as usize]);
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

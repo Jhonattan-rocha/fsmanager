@@ -458,7 +458,24 @@ window.addEventListener("DOMContentLoaded", () => {
       } else {
         out.className = "sub error";
         const det = r.errors.slice(0, 3).join("; ");
-        out.textContent = `✗ ${r.blocks_bad} ruim(ns), ${r.missing_blocks} ausente(s)${det ? " — " + det : ""}`;
+        out.textContent = `✗ ${r.blocks_bad} ruim(ns), ${r.missing_blocks} ausente(s)${det ? " — " + det : ""} — use 🔧 Reparar`;
+      }
+    }, "manageError")
+  );
+  $("repairBtn").addEventListener("click", () =>
+    guarded(async () => {
+      if (!confirm("Reparar trunca/remove arquivos com blocos corrompidos (o dado corrompido é perdido). Continuar?")) return;
+      const out = $("verifyResult");
+      out.className = "sub";
+      out.textContent = "⏳ reparando…";
+      const r = await call("repair_vault");
+      await refresh();
+      if (r.files_damaged === 0) {
+        out.className = "sub ok";
+        out.textContent = "✓ nada a reparar — cofre íntegro";
+      } else {
+        out.className = "sub";
+        out.textContent = `${r.files_damaged} arquivo(s): ${r.truncated.length} truncado(s), ${r.removed.length} removido(s). Rode 🧹 Compactar para liberar espaço.`;
       }
     }, "manageError")
   );

@@ -475,6 +475,27 @@ fn verify_vault(state: State<AppState>) -> Result<VerifyDto, String> {
     })
 }
 
+#[derive(Serialize)]
+struct RepairDto {
+    files_damaged: usize,
+    truncated: Vec<(String, u64)>,
+    removed: Vec<String>,
+}
+
+/// Repara o cofre: trunca/remove arquivos com blocos corrompidos e commita.
+#[tauri::command(async)]
+fn repair_vault(state: State<AppState>) -> Result<RepairDto, String> {
+    with_vault(&state, |v| {
+        let r = v.repair().map_err(s)?;
+        v.commit().map_err(s)?;
+        Ok(RepairDto {
+            files_damaged: r.files_damaged,
+            truncated: r.truncated,
+            removed: r.removed,
+        })
+    })
+}
+
 /// Localiza o binário `fsm-mount` (env `FSM_MOUNT_BIN`, ao lado do exe, ou alvos de dev).
 fn resolve_mount_bin() -> Result<std::path::PathBuf, String> {
     let name = if cfg!(windows) {
@@ -596,6 +617,7 @@ pub fn run() {
             set_quota,
             change_password,
             verify_vault,
+            repair_vault,
             mount_drive,
             unmount_drive,
             mount_status,

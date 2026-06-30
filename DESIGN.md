@@ -81,6 +81,10 @@ uma geração — semente do versionamento.
       bloco (e chunks órfãos), sem usar o cache. Exposto em `fsm verify` (CLI,
       exit≠0 se corrompido) e no painel "⚙️ Gerenciar → 🛡️ Integridade" da UI.
       Restaura sob demanda a garantia que tiramos do caminho de leitura por perf.
+- [x] Reparo: `Vault::repair` remove blocos inválidos do índice e trunca cada
+      arquivo no primeiro chunk ruim (ou remove se nada salvável). Deixa o cofre
+      consistente (verify limpo) e salva o prefixo íntegro. `fsm repair` (CLI) e
+      botão "🔧 Reparar" na UI. Rodar `gc` depois recupera o espaço.
 - [x] Camada de leitura para mount no `fsm-core`: `read_range` (leitura aleatória
       decodificando só os chunks do intervalo), `resolve` e `list_dir` (árvore de
       diretórios derivada dos caminhos planos).
@@ -147,10 +151,13 @@ uma geração — semente do versionamento.
 - Heurística de compressão por SAMPLE: testa zstd em 8 KB; se não comprime,
   grava o chunk cru sem tentar comprimir o resto (acelera muito dados já
   comprimidos: .rar/.jpg/.zip).
-- Throughput medido (300 MB incompressível, release): escrita ~46 MB/s, leitura
-  ~31 MB/s. O teto restante é o IPC do WinFsp + acesso serializado ao vault
-  (CoarseGuard + Mutex). Futuro p/ ir além: leituras paralelas (pread/handles
-  múltiplos), menos cópias, mmap do `.vault`.
+- LEITURAS PARALELAS: o `read_range` é `&self` (leitura POSICIONADA via
+  `seek_read`/`read_at` — sem `seek` mutável) e o cache é `Mutex<BlockCache>`
+  (Arc por bloco). O mount usa `RwLock<Vault>` (leituras compartilhadas, escritas
+  exclusivas) + `FineGuard` (WinFsp despacha reads concorrentes). Medido:
+  sequencial ~29 MB/s, 4 leituras paralelas ~43 MB/s agregado (era serializado).
+- Throughput: o teto restante é o IPC do WinFsp + contenção no Mutex do cache.
+  Futuro: menos cópias, mmap do `.vault`.
 
 ## Mount (crates/fsm-mount) — binário separado
 GPL-3.0 porque linka `winfsp` (GPLv3); por isso é um BINÁRIO À PARTE — `fsm-core`,

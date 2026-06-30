@@ -6,7 +6,7 @@
 //! via [`Vault::write_file`], seguido de commit.
 
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -15,7 +15,7 @@ use winfsp::filesystem::{
     DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo,
     VolumeInfo, WideNameInfo,
 };
-use winfsp::host::{CoarseGuard, FileSystemHost, FileSystemParams, VolumeParams};
+use winfsp::host::{FileSystemHost, FileSystemParams, FineGuard, VolumeParams};
 use winfsp::U16CStr;
 use windows::Win32::Foundation::{
     STATUS_DIRECTORY_NOT_EMPTY, STATUS_END_OF_FILE, STATUS_INVALID_PARAMETER,
@@ -32,7 +32,8 @@ const FSP_CLEANUP_DELETE: u32 = 0x01;
 
 /// Contexto do filesystem montado.
 struct FsmFs {
-    vault: Mutex<Vault>,
+    /// `RwLock`: leituras compartilhadas (paralelas), escritas exclusivas.
+    vault: RwLock<Vault>,
     sd: Vec<u8>,
     /// Diretório do host onde o `.vault` vive (para reportar espaço livre real).
     vault_dir: String,
@@ -183,7 +184,7 @@ impl FsmFs {
         if st.buf.is_some() {
             return Ok(());
         }
-        let mut v = self.vault.lock().unwrap();
+        let v = self.vault.read().unwrap();
         let buf = if let Some(w) = st.writer.take() {
             v.writer_to_buffer(w).map_err(io_fsp)?
         } else {
@@ -199,7 +200,7 @@ impl FsmFs {
 
     /// Persiste as alterações: finaliza o writer streaming OU grava o buffer.
     fn persist(&self, ctx: &Handle, st: &mut HState) -> winfsp::Result<()> {
-        let mut v = self.vault.lock().unwrap();
+        let mut v = self.vault.write().unwrap();
         if let Some(w) = st.writer.take() {
             v.finish_write(w, &ctx.path, now_secs()).map_err(io_fsp)?;
             v.commit().map_err(io_fsp)?;
@@ -222,7 +223,7 @@ impl FsmFs {
         if let Some(b) = &st.buf {
             return b.len() as u64;
         }
-        match self.vault.lock().unwrap().resolve(&ctx.path) {
+        match self.vault.read().unwrap().resolve(&ctx.path) {
             Some(NodeKind::File { size, .. }) => size,
             _ => 0,
         }
@@ -241,7 +242,7 @@ impl FileSystemContext for FsmFs {
         let path = win_to_logical(file_name);
         let (_real, kind) = self
             .vault
-            .lock()
+            .read()
             .unwrap()
             .resolve_ci(&path)
             .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
@@ -267,7 +268,7 @@ impl FileSystemContext for FsmFs {
         let path = win_to_logical(file_name);
         let (real, kind) = self
             .vault
-            .lock()
+            .read()
             .unwrap()
             .resolve_ci(&path)
             .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
@@ -293,7 +294,7 @@ impl FileSystemContext for FsmFs {
         let path = win_to_logical(file_name);
         let is_dir = (create_options & FILE_DIRECTORY_FILE) != 0;
 
-        let mut v = self.vault.lock().unwrap();
+        let mut v = self.vault.write().unwrap();
         if v.resolve_ci(&path).is_some() {
             return Err(STATUS_OBJECT_NAME_COLLISION.into());
         }
@@ -339,7 +340,7 @@ impl FileSystemContext for FsmFs {
 
     fn get_volume_info(&self, out: &mut VolumeInfo) -> winfsp::Result<()> {
         // Adaptativo: livre = espaço real do host; total = usado + livre.
-        let used = self.vault.lock().unwrap().stats().logical_bytes;
+        let used = self.vault.read().unwrap().stats().logical_bytes;
         let free = host_free_bytes(&self.vault_dir);
         out.total_size = used + free;
         out.free_size = free;
@@ -368,7 +369,7 @@ impl FileSystemContext for FsmFs {
             drop(st);
             let data = self
                 .vault
-                .lock()
+                .read()
                 .unwrap()
                 .read_range(&context.path, offset, buffer.len())
                 .map_err(io_fsp)?;
@@ -403,7 +404,7 @@ impl FileSystemContext for FsmFs {
                 offset
             };
             {
-                let mut v = self.vault.lock().unwrap();
+                let mut v = self.vault.write().unwrap();
                 v.stream_write(st.writer.as_mut().unwrap(), at, buffer)
                     .map_err(io_fsp)?;
             }
@@ -454,7 +455,7 @@ impl FileSystemContext for FsmFs {
             return Err(STATUS_INVALID_PARAMETER.into());
         }
         // Overwrite (CREATE_ALWAYS/TRUNCATE): zera e reabre em streaming.
-        let writer = self.vault.lock().unwrap().stream_writer();
+        let writer = self.vault.read().unwrap().stream_writer();
         let mut st = context.state.lock().unwrap();
         st.writer = Some(writer);
         st.buf = None;
@@ -511,7 +512,7 @@ impl FileSystemContext for FsmFs {
     ) -> winfsp::Result<()> {
         if delete_file && context.is_dir {
             // Recusa rmdir de diretório não vazio.
-            if !self.vault.lock().unwrap().list_dir(&context.path).is_empty() {
+            if !self.vault.read().unwrap().list_dir(&context.path).is_empty() {
                 return Err(STATUS_DIRECTORY_NOT_EMPTY.into());
             }
         }
@@ -527,7 +528,7 @@ impl FileSystemContext for FsmFs {
     ) -> winfsp::Result<()> {
         let from = win_to_logical(file_name);
         let to = win_to_logical(new_file_name);
-        let mut v = self.vault.lock().unwrap();
+        let mut v = self.vault.write().unwrap();
         let real_from = v.resolve_ci(&from).map(|(p, _)| p).unwrap_or(from);
         v.rename(&real_from, &to).map_err(io_fsp)?;
         v.commit().map_err(io_fsp)?;
@@ -547,7 +548,7 @@ impl FileSystemContext for FsmFs {
             }
             Some(_) => fill_dir(file_info),
             None => {
-                let _ = self.vault.lock().unwrap().commit();
+                let _ = self.vault.write().unwrap().commit();
             }
         }
         Ok(())
@@ -556,7 +557,7 @@ impl FileSystemContext for FsmFs {
     fn cleanup(&self, context: &Handle, _file_name: Option<&U16CStr>, flags: u32) {
         let mut st = context.state.lock().unwrap();
         if flags & FSP_CLEANUP_DELETE != 0 {
-            let mut v = self.vault.lock().unwrap();
+            let mut v = self.vault.write().unwrap();
             if context.is_dir {
                 let _ = v.remove_empty_dir(&context.path);
             } else {
@@ -580,7 +581,7 @@ impl FileSystemContext for FsmFs {
         let child = join_logical(&context.path, &leaf);
         let (real, kind) = self
             .vault
-            .lock()
+            .read()
             .unwrap()
             .resolve_ci(&child)
             .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
@@ -598,7 +599,7 @@ impl FileSystemContext for FsmFs {
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
         if let Ok(lock) = context.dir_buffer.acquire(marker.is_none(), None) {
-            let entries = self.vault.lock().unwrap().list_dir(&context.path);
+            let entries = self.vault.read().unwrap().list_dir(&context.path);
             for entry in entries {
                 let mut info: DirInfo<255> = DirInfo::new();
                 info.set_name(&entry.name)?;
@@ -655,7 +656,7 @@ pub fn mount(vault_path: &str, mountpoint: &str, password: Option<&str>) -> Resu
         .unwrap_or_else(|| ".".to_string());
 
     let context = FsmFs {
-        vault: Mutex::new(vault),
+        vault: RwLock::new(vault),
         sd: make_security_descriptor()?,
         vault_dir,
         label: "fsmanager".to_string(),
@@ -678,7 +679,9 @@ pub fn mount(vault_path: &str, mountpoint: &str, password: Option<&str>) -> Resu
 
     let mut fsparams = FileSystemParams::default_params(params);
     fsparams.use_dir_info_by_name = true;
-    let mut host = FileSystemHost::<FsmFs, CoarseGuard>::new_with_options(fsparams, context)
+    // FineGuard: WinFsp despacha callbacks (incl. reads) em paralelo; com
+    // RwLock<Vault> as leituras rodam concorrentes, escritas são exclusivas.
+    let mut host = FileSystemHost::<FsmFs, FineGuard>::new_with_options(fsparams, context)
         .map_err(|e| anyhow::anyhow!("criando filesystem: {e:?}"))?;
     host.mount(mountpoint)
         .map_err(|e| anyhow::anyhow!("montando em {mountpoint}: {e:?}"))?;
