@@ -301,6 +301,30 @@ fn make_dir(state: State<AppState>, path: String) -> Result<(), String> {
     })
 }
 
+#[derive(Serialize)]
+struct SearchHitDto {
+    path: String,
+    is_dir: bool,
+    size: u64,
+    mtime: i64,
+}
+
+/// Busca recursiva no cofre inteiro por nome (substring, case-insensitive).
+#[tauri::command]
+fn search(state: State<AppState>, query: String) -> Result<Vec<SearchHitDto>, String> {
+    with_vault(&state, |v| {
+        Ok(v.search(&query)
+            .into_iter()
+            .map(|h| SearchHitDto {
+                path: h.path,
+                is_dir: h.is_dir,
+                size: h.size,
+                mtime: h.mtime,
+            })
+            .collect())
+    })
+}
+
 /// Cria um arquivo vazio (não sobrescreve um item existente).
 #[tauri::command]
 fn new_file(state: State<AppState>, path: String) -> Result<(), String> {
@@ -730,6 +754,7 @@ pub fn run() {
             list_dir,
             make_dir,
             new_file,
+            search,
             add_files,
             add_folder,
             add_dropped,

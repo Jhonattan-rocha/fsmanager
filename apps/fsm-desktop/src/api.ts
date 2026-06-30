@@ -38,6 +38,13 @@ export interface DirEntry {
   mtime: number;
 }
 
+export interface SearchHit {
+  path: string;
+  is_dir: boolean;
+  size: number;
+  mtime: number;
+}
+
 export interface VerifyResult {
   healthy: boolean;
   blocks_ok: number;
@@ -65,6 +72,7 @@ export const api = {
   getInfo: () => invoke<VaultInfo>("get_info"),
 
   listDir: (path: string) => invoke<DirEntry[]>("list_dir", { path }),
+  search: (query: string) => invoke<SearchHit[]>("search", { query }),
   makeDir: (path: string) => invoke<void>("make_dir", { path }),
   newFile: (path: string) => invoke<void>("new_file", { path }),
 

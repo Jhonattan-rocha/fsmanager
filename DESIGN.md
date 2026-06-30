@@ -83,6 +83,12 @@ uma geração — semente do versionamento.
       sistema de botões/inputs) + **CSS Modules por componente**. Drag interno
       compartilha estado via singleton de módulo `dragState`. `npm install` é
       pré-requisito do build (os scripts já chamam).
+- [x] BUSCA RECURSIVA NO COFRE: `Vault::search(query)` varre todos os arquivos +
+      pastas (explícitas e implícitas) por substring no nome (case-insensitive),
+      retornando caminhos completos. Comando `search` no backend; UI tem um toggle
+      "Pasta | Cofre" no cabeçalho — em "Cofre" o mesmo campo busca em tudo
+      (debounce 200ms) e mostra resultados com o caminho. Ações por resultado:
+      📂 ir para a pasta (revela + realça), ⬇️ extrair, 🗑️ excluir.
 - [x] UI BUSCA + ORDENAÇÃO + DRAG DE PASTAS: filtro por nome na pasta atual
       (substring, client-side, no cabeçalho do painel); ordenação clicável por
       coluna (Nome/Tamanho/Modificado, com seta ▲/▼, pastas sempre primeiro);

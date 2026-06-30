@@ -930,6 +930,67 @@ impl Vault {
         entries
     }
 
+    /// Busca RECURSIVA no cofre inteiro: retorna todo arquivo/pasta cujo NOME
+    /// (último componente) contém `query` (case-insensitive). Inclui pastas
+    /// explícitas e implícitas (derivadas dos caminhos dos arquivos).
+    pub fn search(&self, query: &str) -> Vec<SearchHit> {
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let basename_has = |path: &str| {
+            path.rsplit('/')
+                .next()
+                .map(|n| n.to_lowercase().contains(&q))
+                .unwrap_or(false)
+        };
+        let mut hits: Vec<SearchHit> = Vec::new();
+
+        // Arquivos.
+        for (path, e) in &self.catalog.files {
+            if basename_has(path) {
+                hits.push(SearchHit {
+                    path: path.clone(),
+                    is_dir: false,
+                    size: e.size,
+                    mtime: e.mtime,
+                });
+            }
+        }
+
+        // Pastas (explícitas + ancestrais implícitos), deduplicadas.
+        let mut dirs: BTreeSet<String> = self.catalog.dirs.clone();
+        for path in self.catalog.files.keys() {
+            let mut p = path.as_str();
+            while let Some(idx) = p.rfind('/') {
+                if idx == 0 {
+                    break;
+                }
+                let parent = &p[..idx];
+                dirs.insert(parent.to_string());
+                p = parent;
+            }
+        }
+        for d in &dirs {
+            if basename_has(d) {
+                hits.push(SearchHit {
+                    path: d.clone(),
+                    is_dir: true,
+                    size: 0,
+                    mtime: 0,
+                });
+            }
+        }
+
+        // Pastas primeiro, depois arquivos; cada grupo por caminho.
+        hits.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.path.cmp(&b.path),
+        });
+        hits
+    }
+
     /// Remove um arquivo lógico do catálogo. Retorna `true` se existia.
     /// O espaço dos blocos só é recuperado em [`compact_to`].
     pub fn remove(&mut self, logical: &str) -> Result<bool> {
@@ -1426,6 +1487,14 @@ pub struct DirEntry {
     pub mtime: i64,
 }
 
+/// Resultado de [`Vault::search`]: caminho lógico completo de um acerto.
+pub struct SearchHit {
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub mtime: i64,
+}
+
 /// Resultado de uma verificação de integridade ([`Vault::verify`]).
 #[derive(Default)]
 pub struct VerifyReport {
@@ -1777,6 +1846,37 @@ mod tests {
         assert!(!rep2.is_healthy());
         assert!(rep2.blocks_bad > 0);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_finds_across_subfolders() {
+        let dir = tmp_dir("search");
+        let vp = dir.join("s.vault");
+        let _ = std::fs::remove_file(&vp);
+        let mut v = Vault::create(&vp, DEFAULT_AVG_CHUNK).unwrap();
+        v.write_file("/docs/relatorio.pdf", b"a", 1).unwrap();
+        v.write_file("/docs/2020/foto.jpg", b"b", 1).unwrap();
+        v.write_file("/notas.txt", b"c", 1).unwrap();
+        v.create_dir("/relatorios").unwrap();
+        v.commit().unwrap();
+
+        let hits = v.search("relat");
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert!(paths.contains(&"/docs/relatorio.pdf"));
+        assert!(paths.contains(&"/relatorios"));
+        assert!(hits[0].is_dir); // pastas primeiro
+
+        let foto = v.search("FOTO"); // case-insensitive
+        assert_eq!(foto.len(), 1);
+        assert_eq!(foto[0].path, "/docs/2020/foto.jpg");
+        assert!(!foto[0].is_dir);
+
+        // "docs" casa a pasta (explícita via prefixo dos arquivos).
+        let docs = v.search("docs");
+        assert!(docs.iter().any(|h| h.path == "/docs" && h.is_dir));
+
+        assert!(v.search("").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

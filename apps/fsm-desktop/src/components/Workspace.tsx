@@ -7,6 +7,7 @@ import {
   onAddProgress,
   onOsDrag,
   type DirEntry,
+  type SearchHit,
   type VaultInfo,
 } from "../api";
 import { useToast } from "../contexts/ToastContext";
@@ -15,6 +16,7 @@ import Toolbar from "./Toolbar";
 import StatsBar from "./StatsBar";
 import BatchBar from "./BatchBar";
 import FileTable from "./FileTable";
+import SearchView from "./SearchView";
 import SnapshotPanel from "./SnapshotPanel";
 import ManageModal from "./ManageModal";
 import Progress from "./Progress";
@@ -42,6 +44,8 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
   const [renaming, setRenaming] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" }>({ key: "name", dir: "asc" });
+  const [scope, setScope] = useState<"folder" | "vault">("folder");
+  const [results, setResults] = useState<SearchHit[]>([]);
 
   const toast = useToast();
   const openMenu = useContextMenu();
@@ -71,6 +75,31 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
 
   const onSort = (key: SortKey) =>
     setSort((s) => (s.key === key ? { key, dir: s.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" }));
+
+  // Busca recursiva no cofre (escopo "vault"), com debounce de 200ms.
+  useEffect(() => {
+    if (scope !== "vault") return;
+    const q = filter.trim();
+    if (!q) {
+      setResults([]);
+      return;
+    }
+    let alive = true;
+    const t = window.setTimeout(() => {
+      api
+        .search(q)
+        .then((r) => alive && setResults(r))
+        .catch(() => {});
+    }, 200);
+    return () => {
+      alive = false;
+      window.clearTimeout(t);
+    };
+  }, [filter, scope]);
+  const runSearch = () => {
+    const q = filter.trim();
+    if (scope === "vault" && q) api.search(q).then(setResults).catch(() => {});
+  };
 
   const refresh = useCallback(async (p?: string) => {
     const target = p ?? pathRef.current;
@@ -231,6 +260,34 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
       if (!confirm(`Remover ${what}?`)) return;
       await api.removePath(joinPath(path, name), isDir);
       await refresh();
+      toast("removido");
+    });
+
+  // ---- resultados de busca (caminhos completos) ----
+  const revealHit = (p: string, isDir: boolean) => {
+    setScope("folder");
+    if (isDir) {
+      navigate(p);
+      return;
+    }
+    const idx = p.lastIndexOf("/");
+    const parent = idx > 0 ? p.slice(0, idx) : "/";
+    const base = p.slice(idx + 1);
+    navigate(parent);
+    setFilter(base); // realça o item na pasta
+  };
+  const extractHit = (p: string) =>
+    guarded(async () => {
+      const saved = await api.extractFile(p);
+      if (saved) toast(`extraído para ${saved}`);
+    });
+  const removeHit = (p: string, isDir: boolean) =>
+    guarded(async () => {
+      const what = isDir ? `a pasta "${p}" e tudo dentro dela` : `"${p}"`;
+      if (!confirm(`Remover ${what}?`)) return;
+      await api.removePath(p, isDir);
+      await refresh();
+      runSearch();
       toast("removido");
     });
 
@@ -434,35 +491,61 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
           <div className={styles.panelHead}>
             <input
               className={styles.filter}
-              placeholder="🔎 filtrar nesta pasta…"
+              placeholder={scope === "vault" ? "🌐 buscar no cofre inteiro…" : "🔎 filtrar nesta pasta…"}
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
             />
-            <span className="sub">
-              {filter ? `${visible.length} de ${sorted.length}` : `${sorted.length} item(ns)`}
-            </span>
+            <div className={styles.headRight}>
+              {scope === "folder" && (
+                <span className="sub">{filter ? `${visible.length}/${sorted.length}` : `${sorted.length}`}</span>
+              )}
+              <div className={styles.scope}>
+                <button
+                  className={`small ${scope === "folder" ? "primary" : "ghost"}`}
+                  onClick={() => setScope("folder")}
+                >
+                  Pasta
+                </button>
+                <button
+                  className={`small ${scope === "vault" ? "primary" : "ghost"}`}
+                  onClick={() => setScope("vault")}
+                >
+                  Cofre
+                </button>
+              </div>
+            </div>
           </div>
-          <FileTable
-            entries={visible}
-            selected={selected}
-            currentPath={path}
-            sort={sort}
-            onSort={onSort}
-            pendingNew={pendingNew}
-            renaming={renaming}
-            onSelect={handleSelect}
-            onOpen={openEntry}
-            onExtract={extractOne}
-            onStartRename={setRenaming}
-            onRemove={removeOne}
-            onMoveTo={moveTo}
-            onCommitNew={commitNew}
-            onCancelNew={() => setPendingNew(null)}
-            onCommitRename={commitRename}
-            onCancelRename={() => setRenaming(null)}
-            onRowMenu={openRowMenu}
-            onBackgroundMenu={openBackgroundMenu}
-          />
+          {scope === "vault" ? (
+            <SearchView
+              results={results}
+              query={filter}
+              onReveal={revealHit}
+              onExtract={extractHit}
+              onRemove={removeHit}
+            />
+          ) : (
+            <FileTable
+              entries={visible}
+              selected={selected}
+              currentPath={path}
+              sort={sort}
+              onSort={onSort}
+              pendingNew={pendingNew}
+              renaming={renaming}
+              onSelect={handleSelect}
+              onOpen={openEntry}
+              onExtract={extractOne}
+              onStartRename={setRenaming}
+              onRemove={removeOne}
+              onMoveTo={moveTo}
+              onCommitNew={commitNew}
+              onCancelNew={() => setPendingNew(null)}
+              onCommitRename={commitRename}
+              onCancelRename={() => setRenaming(null)}
+              onRowMenu={openRowMenu}
+              onBackgroundMenu={openBackgroundMenu}
+            />
+          )}
         </div>
         <SnapshotPanel
           snapshots={info.snapshots}
