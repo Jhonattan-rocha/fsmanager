@@ -73,6 +73,14 @@ uma geração — semente do versionamento.
       Comandos pesados são `#[command(async)]` (fora da thread da UI) e as crates
       de compressão/hash são otimizadas mesmo em `tauri dev` (profile overrides).
       ⚠️ args de comando Tauri são camelCase no JS (Rust `dest_dir` → JS `destDir`).
+- [x] UI SELEÇÃO MÚLTIPLA + AÇÕES EM LOTE: clique/Ctrl-clique/Shift-clique
+      seleciona; barra de lote (extrair/mover/excluir) + menu de contexto ciente
+      da seleção. Comandos `remove_paths`/`move_paths`/`extract_files` fazem N
+      itens em UMA transação (1 commit). MOVER entre pastas de 2 jeitos:
+      drag-drop interno (HTML5 DnD: arrasta linhas para uma pasta/breadcrumb) e
+      recortar/colar (Ctrl+X/Ctrl+V ou botões — fallback p/ webviews que blocam
+      DnD interno). Atalhos: Esc limpa, Del exclui, Ctrl+A tudo. Backend trava
+      mover pasta para dentro de si mesma. `move_paths` usa `rename` (re-chaveia).
 - [x] Gerenciamento do cofre: COTA de tamanho (`set_quota`/`quota`, enforce no
       `write_block`) e SENHA (set/trocar/remover via `rekey_to` — reescreve
       re-encriptando; hash de conteúdo preservado). UI: painel "⚙️ Gerenciar".

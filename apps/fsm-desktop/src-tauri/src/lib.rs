@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use fsm_core::{Vault, DEFAULT_AVG_CHUNK};
+use fsm_core::{NodeKind, Vault, DEFAULT_AVG_CHUNK};
 use serde::Serialize;
 use tauri::{Emitter, State};
 use tauri_plugin_dialog::DialogExt;
@@ -355,6 +355,73 @@ fn rename_path(state: State<AppState>, from: String, to: String) -> Result<(), S
     })
 }
 
+/// Remove vários caminhos (arquivos ou pastas) numa única transação.
+#[tauri::command]
+fn remove_paths(state: State<AppState>, paths: Vec<String>) -> Result<(), String> {
+    with_vault(&state, |v| {
+        for p in &paths {
+            match v.resolve(p) {
+                Some(NodeKind::Dir) => {
+                    v.remove_dir(p).map_err(s)?;
+                }
+                Some(NodeKind::File { .. }) => {
+                    v.remove(p).map_err(s)?;
+                }
+                None => {}
+            }
+        }
+        v.commit().map_err(s)
+    })
+}
+
+/// Move vários caminhos para dentro de `dest_dir` (rename de cada um).
+#[tauri::command]
+fn move_paths(
+    state: State<AppState>,
+    paths: Vec<String>,
+    dest_dir: String,
+) -> Result<(), String> {
+    with_vault(&state, |v| {
+        for p in &paths {
+            // Não mover uma pasta para dentro dela mesma / de um descendente.
+            let prefix = format!("{p}/");
+            if dest_dir == *p || dest_dir.starts_with(&prefix) {
+                continue;
+            }
+            let name = p.rsplit('/').next().unwrap_or("item");
+            let to = join_logical(&dest_dir, name);
+            if to == *p {
+                continue;
+            }
+            v.rename(p, &to).map_err(s)?;
+        }
+        v.commit().map_err(s)
+    })
+}
+
+/// Extrai vários arquivos para uma pasta do disco (preservando os nomes).
+#[tauri::command(async)]
+fn extract_files(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    paths: Vec<String>,
+) -> Result<Option<String>, String> {
+    let chosen = app.dialog().file().blocking_pick_folder();
+    let dest = match chosen {
+        Some(p) => p.to_string(),
+        None => return Ok(None),
+    };
+    let guard = state.open.lock().unwrap();
+    let ov = guard.as_ref().ok_or("nenhum container aberto")?;
+    for p in &paths {
+        let name = p.rsplit('/').next().unwrap_or("arquivo");
+        let out = Path::new(&dest).join(name);
+        let mut f = std::fs::File::create(&out).map_err(s)?;
+        ov.vault.extract(p, &mut f).map_err(s)?;
+    }
+    Ok(Some(dest))
+}
+
 #[tauri::command]
 fn snapshot_create(state: State<AppState>, name: String) -> Result<(), String> {
     with_vault(&state, |v| {
@@ -608,7 +675,10 @@ pub fn run() {
             add_files,
             add_dropped,
             extract_file,
+            extract_files,
             remove_path,
+            remove_paths,
+            move_paths,
             rename_path,
             snapshot_create,
             snapshot_restore,

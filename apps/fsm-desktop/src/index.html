@@ -43,10 +43,21 @@
         <div class="tools">
           <button id="btnAdd" class="primary">➕ Adicionar</button>
           <button id="btnNewFolder">📁 Nova pasta</button>
+          <button id="btnPaste" class="hidden">📋 Colar</button>
           <button id="btnManage">⚙️ Gerenciar</button>
           <button id="btnMount">🔌 Montar</button>
           <button id="btnGc">🧹 Compactar</button>
           <button id="btnClose" class="ghost">✕ Fechar</button>
+        </div>
+      </div>
+
+      <div id="batchBar" class="batch-bar hidden">
+        <span id="batchCount" class="batch-count"></span>
+        <div class="batch-actions">
+          <button id="batchExtract" class="small">⬇️ Extrair</button>
+          <button id="batchMove" class="small">✂️ Mover</button>
+          <button id="batchDelete" class="small danger">🗑️ Excluir</button>
+          <button id="batchClear" class="small ghost">✕ Limpar seleção</button>
         </div>
       </div>
 

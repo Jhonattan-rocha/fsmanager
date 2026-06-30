@@ -5,6 +5,11 @@ const tauriEvent = window.__TAURI__.event;
 let vaultOpen = false;
 let currentPath = "/";
 let lastInfo = null;
+let lastEntries = []; // entradas atualmente renderizadas (ordem visível)
+let selected = new Set(); // nomes selecionados na pasta atual
+let lastClickedName = null; // âncora p/ seleção com Shift
+let clipboard = []; // caminhos lógicos "recortados" para mover
+let dragItems = []; // caminhos sendo arrastados (drag interno)
 
 // ----------------------- utilidades -----------------------
 function $(id) {
@@ -107,6 +112,7 @@ async function refresh() {
 }
 async function navigate(path) {
   currentPath = path || "/";
+  clearSelection();
   await refresh();
 }
 
@@ -129,8 +135,12 @@ function renderFiles(entries) {
     if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
     return a.name.localeCompare(b.name);
   });
+  lastEntries = sorted;
+  // Descarta da seleção nomes que não existem mais nesta pasta.
+  selected = new Set([...selected].filter((n) => sorted.some((e) => e.name === n)));
   if (sorted.length === 0) {
     tbody.innerHTML = `<tr><td colspan="4" class="empty">pasta vazia — arraste arquivos aqui ou use ➕ Adicionar</td></tr>`;
+    updateBatchBar();
     return;
   }
   tbody.innerHTML = sorted
@@ -138,10 +148,11 @@ function renderFiles(entries) {
       const icon = e.is_dir ? "📁" : "📄";
       const size = e.is_dir ? "—" : fmtBytes(e.size);
       const date = e.is_dir ? "—" : fmtDate(e.mtime);
+      const sel = selected.has(e.name) ? " selected" : "";
       const actions = e.is_dir
         ? `<button class="small" data-act="rename">✏️</button><button class="small danger" data-act="remove">🗑️</button>`
         : `<button class="small" data-act="extract">⬇️</button><button class="small" data-act="rename">✏️</button><button class="small danger" data-act="remove">🗑️</button>`;
-      return `<tr data-name="${escapeHtml(e.name)}" data-dir="${e.is_dir ? 1 : 0}">
+      return `<tr draggable="true" class="${sel}" data-name="${escapeHtml(e.name)}" data-dir="${e.is_dir ? 1 : 0}">
         <td class="name ${e.is_dir ? "is-dir" : ""}">${icon} ${escapeHtml(e.name)}</td>
         <td class="num">${size}</td>
         <td class="num dim">${date}</td>
@@ -149,6 +160,99 @@ function renderFiles(entries) {
       </tr>`;
     })
     .join("");
+  updateBatchBar();
+}
+
+// ----------------------- seleção & ações em lote -----------------------
+function fullPath(name) {
+  return joinPath(currentPath, name);
+}
+function selectedPaths() {
+  return [...selected].map(fullPath);
+}
+function clearSelection() {
+  selected.clear();
+  lastClickedName = null;
+  applySelectionClasses();
+}
+function selectAll() {
+  for (const e of lastEntries) selected.add(e.name);
+  applySelectionClasses();
+}
+function applySelectionClasses() {
+  for (const tr of $("fileList").querySelectorAll("tr[data-name]")) {
+    tr.classList.toggle("selected", selected.has(tr.dataset.name));
+  }
+  updateBatchBar();
+}
+function updateBatchBar() {
+  const n = selected.size;
+  $("batchCount").textContent = `${n} selecionado${n === 1 ? "" : "s"}`;
+  $("batchBar").classList.toggle("hidden", n === 0);
+  const paste = $("btnPaste");
+  paste.classList.toggle("hidden", clipboard.length === 0);
+  if (clipboard.length) paste.textContent = `📋 Colar (${clipboard.length})`;
+}
+function handleRowSelect(name, e) {
+  const names = lastEntries.map((x) => x.name);
+  if (e.shiftKey && lastClickedName) {
+    const a = names.indexOf(lastClickedName);
+    const b = names.indexOf(name);
+    if (a >= 0 && b >= 0) {
+      if (!e.ctrlKey && !e.metaKey) selected.clear();
+      const [lo, hi] = a < b ? [a, b] : [b, a];
+      for (let i = lo; i <= hi; i++) selected.add(names[i]);
+    }
+  } else if (e.ctrlKey || e.metaKey) {
+    selected.has(name) ? selected.delete(name) : selected.add(name);
+    lastClickedName = name;
+  } else {
+    selected.clear();
+    selected.add(name);
+    lastClickedName = name;
+  }
+  applySelectionClasses();
+}
+
+function batchExtract() {
+  const paths = selectedPaths();
+  if (!paths.length) return;
+  guarded(async () => {
+    toast(`⏳ extraindo ${paths.length} arquivo(s)…`, false, true);
+    const dest = await call("extract_files", { paths });
+    if (dest) toast(`${paths.length} arquivo(s) extraído(s) para ${dest}`);
+  });
+}
+function batchDelete() {
+  const paths = selectedPaths();
+  if (!paths.length) return;
+  guarded(async () => {
+    if (!confirm(`Excluir ${paths.length} item(ns) selecionado(s)? Pastas serão removidas com todo o conteúdo.`)) return;
+    await call("remove_paths", { paths });
+    clearSelection();
+    await refresh();
+    toast(`${paths.length} item(ns) removido(s)`);
+  });
+}
+function batchMove() {
+  clipboard = selectedPaths();
+  if (!clipboard.length) return;
+  toast(`✂️ ${clipboard.length} item(ns) recortado(s) — abra a pasta destino e clique em 📋 Colar`);
+  clearSelection();
+  updateBatchBar();
+}
+function doPaste() {
+  if (!clipboard.length) return;
+  const items = clipboard;
+  guarded(async () => {
+    await call("move_paths", { paths: items, destDir: currentPath });
+    clipboard = [];
+    await refresh();
+    toast(`${items.length} item(ns) movido(s) para cá`);
+  });
+}
+function clearDropTargets() {
+  document.querySelectorAll(".drop-target").forEach((el) => el.classList.remove("drop-target"));
 }
 
 function renderStats(s) {
@@ -408,6 +512,36 @@ window.addEventListener("DOMContentLoaded", () => {
   $("btnNewFolder").addEventListener("click", () => {
     if (vaultOpen) startInlineNew();
   });
+  $("btnPaste").addEventListener("click", doPaste);
+
+  // --- barra de ações em lote ---
+  $("batchExtract").addEventListener("click", batchExtract);
+  $("batchMove").addEventListener("click", batchMove);
+  $("batchDelete").addEventListener("click", batchDelete);
+  $("batchClear").addEventListener("click", clearSelection);
+
+  // --- atalhos de teclado ---
+  window.addEventListener("keydown", (e) => {
+    if (!vaultOpen) return;
+    if (!$("workspace").contains(document.activeElement) && document.activeElement !== document.body) return;
+    const typing = /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName || "");
+    if (typing) return;
+    if (e.key === "Escape") {
+      clearSelection();
+    } else if (e.key === "Delete" && selected.size) {
+      e.preventDefault();
+      batchDelete();
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+      e.preventDefault();
+      selectAll();
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "x" && selected.size) {
+      e.preventDefault();
+      batchMove();
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v" && clipboard.length) {
+      e.preventDefault();
+      doPaste();
+    }
+  });
 
   // --- gerenciar cofre ---
   $("btnManage").addEventListener("click", () => {
@@ -521,14 +655,91 @@ window.addEventListener("DOMContentLoaded", () => {
     const btn = e.target.closest("button[data-path]");
     if (btn) guarded(() => navigate(btn.dataset.path));
   });
+  $("breadcrumbs").addEventListener("dragover", (e) => {
+    if (!dragItems.length) return;
+    const btn = e.target.closest("button[data-path]");
+    if (btn) {
+      e.preventDefault();
+      btn.classList.add("drop-target");
+    }
+  });
+  $("breadcrumbs").addEventListener("dragleave", (e) => {
+    e.target.closest("button[data-path]")?.classList.remove("drop-target");
+  });
+  $("breadcrumbs").addEventListener("drop", (e) => {
+    const btn = e.target.closest("button[data-path]");
+    if (!dragItems.length || !btn) return;
+    e.preventDefault();
+    btn.classList.remove("drop-target");
+    const dest = btn.dataset.path;
+    const items = dragItems;
+    dragItems = [];
+    if (dest === currentPath) return;
+    guarded(async () => {
+      await call("move_paths", { paths: items, destDir: dest });
+      clearSelection();
+      await refresh();
+      toast("movido");
+    });
+  });
 
   // --- lista de arquivos: navegação, ações, menu de contexto ---
   $("fileList").addEventListener("click", (e) => {
     const btn = e.target.closest("button[data-act]");
-    if (!btn) return;
-    const tr = btn.closest("tr");
-    const acts = entryActions(tr.dataset.name, tr.dataset.dir === "1");
-    acts[btn.dataset.act]();
+    if (btn) {
+      const tr = btn.closest("tr");
+      const acts = entryActions(tr.dataset.name, tr.dataset.dir === "1");
+      acts[btn.dataset.act]();
+      return;
+    }
+    const tr = e.target.closest("tr[data-name]");
+    if (!tr) return;
+    handleRowSelect(tr.dataset.name, e);
+  });
+
+  // --- drag-and-drop INTERNO: mover itens para uma pasta/breadcrumb ---
+  $("fileList").addEventListener("dragstart", (e) => {
+    const tr = e.target.closest("tr[data-name]");
+    if (!tr) return;
+    const name = tr.dataset.name;
+    if (!selected.has(name)) {
+      selected.clear();
+      selected.add(name);
+      lastClickedName = name;
+      applySelectionClasses();
+    }
+    dragItems = selectedPaths();
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", dragItems.join("\n"));
+  });
+  $("fileList").addEventListener("dragover", (e) => {
+    if (!dragItems.length) return;
+    clearDropTargets();
+    const tr = e.target.closest('tr[data-dir="1"]');
+    if (tr && !selected.has(tr.dataset.name)) {
+      e.preventDefault();
+      tr.classList.add("drop-target");
+    }
+  });
+  $("fileList").addEventListener("drop", (e) => {
+    const tr = e.target.closest('tr[data-dir="1"]');
+    clearDropTargets();
+    if (!dragItems.length || !tr || selected.has(tr.dataset.name)) return;
+    e.preventDefault();
+    const destName = tr.dataset.name;
+    const dest = joinPath(currentPath, destName);
+    const items = dragItems;
+    dragItems = [];
+    guarded(async () => {
+      await call("move_paths", { paths: items, destDir: dest });
+      clearSelection();
+      await refresh();
+      toast(`movido para ${destName}`);
+    });
+  });
+  $("fileList").addEventListener("dragend", () => {
+    dragItems = [];
+    clearDropTargets();
   });
   $("fileList").addEventListener("dblclick", (e) => {
     const tr = e.target.closest("tr[data-name]");
@@ -541,17 +752,37 @@ window.addEventListener("DOMContentLoaded", () => {
     const tr = e.target.closest("tr[data-name]");
     if (!tr) return;
     e.preventDefault();
+    const name = tr.dataset.name;
+    // Clique direito sobre item fora da seleção: seleciona só ele.
+    if (!selected.has(name)) {
+      selected.clear();
+      selected.add(name);
+      lastClickedName = name;
+      applySelectionClasses();
+    }
+    // Vários selecionados → menu em lote.
+    if (selected.size > 1) {
+      const n = selected.size;
+      showCtx(e.clientX, e.clientY, [
+        { label: `⬇️ Extrair ${n} itens`, fn: batchExtract },
+        { label: `✂️ Mover ${n} itens`, fn: batchMove },
+        { label: `🗑️ Excluir ${n} itens`, fn: batchDelete, danger: true },
+      ]);
+      return;
+    }
     const isDir = tr.dataset.dir === "1";
-    const acts = entryActions(tr.dataset.name, isDir);
+    const acts = entryActions(name, isDir);
     const items = isDir
       ? [
           { label: "📂 Abrir", fn: acts.open },
           { label: "✏️ Renomear", fn: acts.rename },
+          { label: "✂️ Mover", fn: batchMove },
           { label: "🗑️ Excluir", fn: acts.remove, danger: true },
         ]
       : [
           { label: "⬇️ Extrair", fn: acts.extract },
           { label: "✏️ Renomear", fn: acts.rename },
+          { label: "✂️ Mover", fn: batchMove },
           { label: "🗑️ Excluir", fn: acts.remove, danger: true },
         ];
     showCtx(e.clientX, e.clientY, items);
