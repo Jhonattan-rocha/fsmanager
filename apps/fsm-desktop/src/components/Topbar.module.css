@@ -1,0 +1,29 @@
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.logo {
+  font-size: 28px;
+}
+.title {
+  margin: 0;
+  font-size: 18px;
+}
+.vaultPath {
+  font-size: 12px;
+  color: var(--dim);
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  max-width: 50%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

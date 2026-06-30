@@ -1,0 +1,75 @@
+.tableWrap {
+  overflow: auto;
+  flex: 1;
+}
+.tableWrap table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.tableWrap thead th {
+  position: sticky;
+  top: 0;
+  background: var(--panel-2);
+  text-align: left;
+  padding: 8px 14px;
+  font-size: 11px;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.tableWrap tbody td {
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.tableWrap tbody tr {
+  user-select: none;
+}
+.tableWrap tbody tr:hover {
+  background: var(--panel-2);
+}
+.tableWrap tbody tr.selected {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+.tableWrap tbody tr.selected:hover {
+  background: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.tableWrap tbody tr.dropTarget {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.num {
+  text-align: right;
+  white-space: nowrap;
+}
+.dim {
+  color: var(--dim);
+}
+.name {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+.name.isDir {
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+}
+.rowActions {
+  text-align: right;
+  white-space: nowrap;
+}
+.empty {
+  text-align: center;
+  color: var(--dim);
+  padding: 24px;
+}
+.inlineEdit {
+  padding: 2px 6px;
+  font-size: 13px;
+  width: 60%;
+  min-width: 160px;
+}
+.editingRow td {
+  background: var(--panel-2);
+}

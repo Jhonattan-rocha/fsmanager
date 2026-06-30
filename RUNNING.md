@@ -14,13 +14,18 @@ O projeto tem **3 binários**:
 
 ## Modo desenvolvimento (UI)
 
+O frontend é **React + TypeScript (Vite)**; o backend é Rust (Tauri). Os
+comandos do backend não mudaram.
+
 ```sh
 cd apps/fsm-desktop
-npm install            # só na 1ª vez
-npm run tauri dev
+npm install            # só na 1ª vez (puxa React + Vite)
+npm run tauri dev      # sobe o Vite (porta 1420) e abre o app
 ```
-A primeira compilação demora um pouco (as crates de compressão/hash são
-otimizadas mesmo em dev, via `[profile.dev.package.*]`). Depois fica rápido.
+`npm run tauri dev` roda o `beforeDevCommand` (Vite) automaticamente. A primeira
+compilação Rust demora um pouco (as crates de compressão/hash são otimizadas
+mesmo em dev, via `[profile.dev.package.*]`). Depois fica rápido, com HMR no
+frontend.
 
 ## Build release (os 3 de uma vez)
 

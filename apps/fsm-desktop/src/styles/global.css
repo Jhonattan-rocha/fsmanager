@@ -1,0 +1,137 @@
+:root {
+  --bg: #0f1115;
+  --panel: #181b22;
+  --panel-2: #1f232c;
+  --border: #2a2f3a;
+  --text: #e6e9ef;
+  --dim: #9aa3b2;
+  --accent: #4f8cff;
+  --accent-2: #2b6fe0;
+  --danger: #ff5c5c;
+  --ok: #41d18b;
+  font-family: "Segoe UI", Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+#root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------- sistema de botões (global, usado por todos os componentes) ---------- */
+button {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 14px;
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, transform 0.05s;
+}
+button:hover {
+  border-color: var(--accent);
+}
+button:active {
+  transform: translateY(1px);
+}
+button.primary {
+  background: var(--accent-2);
+  border-color: var(--accent);
+}
+button.primary:hover {
+  background: var(--accent);
+}
+button.ghost {
+  background: transparent;
+}
+button.small {
+  padding: 5px 9px;
+  font-size: 12px;
+}
+button.danger:hover {
+  border-color: var(--danger);
+}
+
+/* ---------- inputs ---------- */
+input {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 14px;
+  outline: none;
+}
+input:focus {
+  border-color: var(--accent);
+}
+
+/* ---------- utilitários compartilhados ---------- */
+.row {
+  display: flex;
+  gap: 10px;
+}
+.sub {
+  margin: 0;
+  font-size: 12px;
+  color: var(--dim);
+}
+.sub.mini {
+  font-size: 11px;
+  margin-top: 6px;
+}
+.sub.ok {
+  color: var(--ok);
+}
+.sub.error {
+  color: var(--danger);
+}
+.error {
+  color: var(--danger);
+  font-size: 13px;
+  min-height: 18px;
+  margin: 4px 0 0;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 18px;
+}
+.field span {
+  font-size: 12px;
+  color: var(--dim);
+}
+
+/* ---------- layout de card centralizado (telas welcome/mounted) ---------- */
+.welcome {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 28px;
+  width: min(440px, 92vw);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+}
+.card h2 {
+  margin: 0 0 18px;
+  font-size: 20px;
+}

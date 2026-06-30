@@ -1,0 +1,26 @@
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.badge {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  min-width: 84px;
+}
+.k {
+  font-size: 11px;
+  color: var(--dim);
+}
+.v {
+  font-size: 16px;
+  font-weight: 600;
+}
+.state {
+  justify-content: center;
+  font-weight: 600;
+}

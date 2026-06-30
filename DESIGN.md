@@ -73,6 +73,16 @@ uma geração — semente do versionamento.
       Comandos pesados são `#[command(async)]` (fora da thread da UI) e as crates
       de compressão/hash são otimizadas mesmo em `tauri dev` (profile overrides).
       ⚠️ args de comando Tauri são camelCase no JS (Rust `dest_dir` → JS `destDir`).
+- [x] UI MIGRADA PARA REACT + TYPESCRIPT (Vite): o frontend vanilla (~700 linhas
+      de DOM manual) virou componentes React+TS. `tauri.conf.json` usa
+      `devUrl`/`beforeDevCommand` (Vite na porta 1420) e `frontendDist=../dist`.
+      O backend Rust NÃO mudou. Estrutura: `api.ts` (wrappers tipados de invoke +
+      tipos dos DTOs), contexts `Toast`/`ContextMenu`, componentes `Workspace`
+      (orquestra estado), `FileTable`, `Toolbar`, `StatsBar`, `BatchBar`,
+      `SnapshotPanel`, `ManageModal`, `Progress`. Estilo: base global (variáveis +
+      sistema de botões/inputs) + **CSS Modules por componente**. Drag interno
+      compartilha estado via singleton de módulo `dragState`. `npm install` é
+      pré-requisito do build (os scripts já chamam).
 - [x] UI SELEÇÃO MÚLTIPLA + AÇÕES EM LOTE: clique/Ctrl-clique/Shift-clique
       seleciona; barra de lote (extrair/mover/excluir) + menu de contexto ciente
       da seleção. Comandos `remove_paths`/`move_paths`/`extract_files` fazem N

@@ -1,0 +1,49 @@
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: grid;
+  place-items: center;
+  z-index: 80;
+}
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  width: min(460px, 92vw);
+  max-height: 88vh;
+  overflow: auto;
+  padding: 22px 24px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+}
+.head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.head h2 {
+  margin: 0;
+  font-size: 18px;
+}
+.sec {
+  border-top: 1px solid var(--border);
+  padding: 16px 0;
+}
+.sec h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+.usageTrack {
+  height: 10px;
+  background: var(--panel-2);
+  border-radius: 6px;
+  overflow: hidden;
+  margin: 4px 0 12px;
+}
+.usageBar {
+  height: 100%;
+  width: 0;
+  background: linear-gradient(90deg, var(--accent-2), var(--accent));
+  transition: width 0.15s ease;
+}
