@@ -84,11 +84,17 @@ uma geração — semente do versionamento.
       compartilha estado via singleton de módulo `dragState`. `npm install` é
       pré-requisito do build (os scripts já chamam).
 - [x] BUSCA RECURSIVA NO COFRE: `Vault::search(query)` varre todos os arquivos +
-      pastas (explícitas e implícitas) por substring no nome (case-insensitive),
-      retornando caminhos completos. Comando `search` no backend; UI tem um toggle
-      "Pasta | Cofre" no cabeçalho — em "Cofre" o mesmo campo busca em tudo
-      (debounce 200ms) e mostra resultados com o caminho. Ações por resultado:
-      📂 ir para a pasta (revela + realça), ⬇️ extrair, 🗑️ excluir.
+      pastas (explícitas e implícitas) casando o CAMINHO COMPLETO por substring
+      (case-insensitive) — busca por nome ("relatorio") ou trecho de caminho
+      ("docs/2020"). Comando `search` no backend; UI tem um toggle "Pasta | Cofre"
+      no cabeçalho — em "Cofre" o mesmo campo busca em tudo (debounce 200ms) e
+      mostra resultados com o caminho. Ações por resultado: 📖 abrir, 📂 ir para a
+      pasta (revela + realça), ⬇️ extrair, 🗑️ excluir.
+- [x] ABRIR ARQUIVO com o app padrão do SO: comando `open_file` extrai para
+      `temp/fsmanager-open/<nome>` e entrega ao sistema via `tauri-plugin-opener`
+      (chamado do Rust, fora do IPC — sem precisar de permissão extra). Duplo-clique
+      em arquivo agora ABRE (antes extraía); extrair virou ação explícita (botão
+      ⬇️ / menu). Obs.: o SO abre uma CÓPIA temporária — editar não regrava no cofre.
 - [x] UI BUSCA + ORDENAÇÃO + DRAG DE PASTAS: filtro por nome na pasta atual
       (substring, client-side, no cabeçalho do painel); ordenação clicável por
       coluna (Nome/Tamanho/Modificado, com seta ▲/▼, pastas sempre primeiro);

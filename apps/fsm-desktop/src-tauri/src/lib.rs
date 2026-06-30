@@ -416,6 +416,32 @@ fn extract_file(
     Ok(Some(out))
 }
 
+/// Abre um arquivo do cofre com o app padrão do SO. Extrai para um arquivo
+/// temporário (em `temp/fsmanager-open/`) e o entrega ao sistema.
+/// Obs.: o sistema abre uma CÓPIA — editar lá não regrava no cofre.
+#[tauri::command(async)]
+fn open_file(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    logical: String,
+) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let name = logical.rsplit('/').next().unwrap_or("arquivo").to_string();
+    let dir = std::env::temp_dir().join("fsmanager-open");
+    std::fs::create_dir_all(&dir).map_err(s)?;
+    let out = dir.join(&name);
+    {
+        let guard = state.open.lock().unwrap();
+        let ov = guard.as_ref().ok_or("nenhum container aberto")?;
+        let mut f = std::fs::File::create(&out).map_err(s)?;
+        ov.vault.extract(&logical, &mut f).map_err(s)?;
+    }
+    app.opener()
+        .open_path(out.to_string_lossy().to_string(), None::<&str>)
+        .map_err(s)?;
+    Ok(())
+}
+
 #[tauri::command]
 fn remove_path(state: State<AppState>, logical: String, recursive: bool) -> Result<(), String> {
     with_vault(&state, |v| {
@@ -760,6 +786,7 @@ pub fn run() {
             add_dropped,
             extract_file,
             extract_files,
+            open_file,
             remove_path,
             remove_paths,
             move_paths,

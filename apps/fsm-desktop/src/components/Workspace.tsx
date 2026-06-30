@@ -249,6 +249,11 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
 
   // ---- ações de item único ----
   const openEntry = (name: string) => navigate(joinPath(path, name));
+  const openFileEntry = (name: string) =>
+    guarded(async () => {
+      await api.openFile(joinPath(path, name));
+      toast("abrindo com o app padrão…");
+    });
   const extractOne = (name: string) =>
     guarded(async () => {
       const saved = await api.extractFile(joinPath(path, name));
@@ -276,6 +281,11 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
     navigate(parent);
     setFilter(base); // realça o item na pasta
   };
+  const openHit = (p: string) =>
+    guarded(async () => {
+      await api.openFile(p);
+      toast("abrindo com o app padrão…");
+    });
   const extractHit = (p: string) =>
     guarded(async () => {
       const saved = await api.extractFile(p);
@@ -415,6 +425,7 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
             { label: "🗑️ Excluir", danger: true, onClick: () => removeOne(name, true) },
           ]
         : [
+            { label: "📖 Abrir", onClick: () => openFileEntry(name) },
             { label: "⬇️ Extrair", onClick: () => extractOne(name) },
             { label: "✏️ Renomear", onClick: () => setRenaming(name) },
             { label: "✂️ Mover", onClick: () => cutPaths(one) },
@@ -519,6 +530,7 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
             <SearchView
               results={results}
               query={filter}
+              onOpen={openHit}
               onReveal={revealHit}
               onExtract={extractHit}
               onRemove={removeHit}
@@ -534,6 +546,7 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
               renaming={renaming}
               onSelect={handleSelect}
               onOpen={openEntry}
+              onOpenFile={openFileEntry}
               onExtract={extractOne}
               onStartRename={setRenaming}
               onRemove={removeOne}

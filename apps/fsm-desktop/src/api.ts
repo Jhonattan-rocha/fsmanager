@@ -81,6 +81,7 @@ export const api = {
   addDropped: (paths: string[], destDir: string) => invoke<number>("add_dropped", { paths, destDir }),
 
   extractFile: (logical: string) => invoke<string | null>("extract_file", { logical }),
+  openFile: (logical: string) => invoke<void>("open_file", { logical }),
   extractFiles: (paths: string[]) => invoke<string | null>("extract_files", { paths }),
 
   removePath: (logical: string, recursive: boolean) => invoke<void>("remove_path", { logical, recursive }),

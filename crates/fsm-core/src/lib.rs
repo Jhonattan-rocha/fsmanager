@@ -930,25 +930,21 @@ impl Vault {
         entries
     }
 
-    /// Busca RECURSIVA no cofre inteiro: retorna todo arquivo/pasta cujo NOME
-    /// (último componente) contém `query` (case-insensitive). Inclui pastas
-    /// explícitas e implícitas (derivadas dos caminhos dos arquivos).
+    /// Busca RECURSIVA no cofre inteiro: retorna todo arquivo/pasta cujo CAMINHO
+    /// contém `query` (case-insensitive). Casar o caminho inteiro permite buscar
+    /// por nome ("relatorio") ou por trecho de caminho ("docs/2020"). Inclui
+    /// pastas explícitas e implícitas (derivadas dos caminhos dos arquivos).
     pub fn search(&self, query: &str) -> Vec<SearchHit> {
         let q = query.trim().to_lowercase();
         if q.is_empty() {
             return Vec::new();
         }
-        let basename_has = |path: &str| {
-            path.rsplit('/')
-                .next()
-                .map(|n| n.to_lowercase().contains(&q))
-                .unwrap_or(false)
-        };
+        let path_has = |path: &str| path.to_lowercase().contains(&q);
         let mut hits: Vec<SearchHit> = Vec::new();
 
         // Arquivos.
         for (path, e) in &self.catalog.files {
-            if basename_has(path) {
+            if path_has(path) {
                 hits.push(SearchHit {
                     path: path.clone(),
                     is_dir: false,
@@ -972,7 +968,7 @@ impl Vault {
             }
         }
         for d in &dirs {
-            if basename_has(d) {
+            if path_has(d) {
                 hits.push(SearchHit {
                     path: d.clone(),
                     is_dir: true,
@@ -1875,6 +1871,11 @@ mod tests {
         // "docs" casa a pasta (explícita via prefixo dos arquivos).
         let docs = v.search("docs");
         assert!(docs.iter().any(|h| h.path == "/docs" && h.is_dir));
+
+        // Busca por TRECHO DE CAMINHO (não só nome).
+        let frag = v.search("docs/2020");
+        assert!(frag.iter().any(|h| h.path == "/docs/2020/foto.jpg"));
+        assert!(frag.iter().any(|h| h.path == "/docs/2020" && h.is_dir));
 
         assert!(v.search("").is_empty());
         let _ = std::fs::remove_dir_all(&dir);

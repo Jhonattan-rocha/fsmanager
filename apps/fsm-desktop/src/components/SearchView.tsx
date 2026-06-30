@@ -4,12 +4,13 @@ import styles from "./SearchView.module.css";
 interface Props {
   results: SearchHit[];
   query: string;
+  onOpen: (path: string) => void;
   onReveal: (path: string, isDir: boolean) => void;
   onExtract: (path: string) => void;
   onRemove: (path: string, isDir: boolean) => void;
 }
 
-export default function SearchView({ results, query, onReveal, onExtract, onRemove }: Props) {
+export default function SearchView({ results, query, onOpen, onReveal, onExtract, onRemove }: Props) {
   return (
     <div className={styles.wrap}>
       <div className={styles.head}>
@@ -26,7 +27,11 @@ export default function SearchView({ results, query, onReveal, onExtract, onRemo
             const parent = idx > 0 ? h.path.slice(0, idx) : "/";
             const base = h.path.slice(idx + 1);
             return (
-              <div className={styles.row} key={h.path} onDoubleClick={() => onReveal(h.path, h.is_dir)}>
+              <div
+                className={styles.row}
+                key={h.path}
+                onDoubleClick={() => (h.is_dir ? onReveal(h.path, true) : onOpen(h.path))}
+              >
                 <span className={styles.icon}>{h.is_dir ? "📁" : "📄"}</span>
                 <div className={styles.label}>
                   <span className={styles.name}>{base}</span>
@@ -34,6 +39,11 @@ export default function SearchView({ results, query, onReveal, onExtract, onRemo
                 </div>
                 <span className={styles.size}>{h.is_dir ? "" : fmtBytes(h.size)}</span>
                 <div className={styles.actions}>
+                  {!h.is_dir && (
+                    <button className="small" title="Abrir" onClick={() => onOpen(h.path)}>
+                      📖
+                    </button>
+                  )}
                   <button className="small" title="Ir para a pasta" onClick={() => onReveal(h.path, h.is_dir)}>
                     📂
                   </button>

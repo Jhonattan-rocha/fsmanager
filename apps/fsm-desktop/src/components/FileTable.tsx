@@ -16,6 +16,7 @@ interface Props {
   renaming: string | null;
   onSelect: (name: string, mods: SelectMods) => void;
   onOpen: (name: string) => void;
+  onOpenFile: (name: string) => void;
   onExtract: (name: string) => void;
   onStartRename: (name: string) => void;
   onRemove: (name: string, isDir: boolean) => void;
@@ -159,7 +160,7 @@ export default function FileTable(p: Props) {
                   if (!isRen) p.onSelect(e.name, ev);
                 }}
                 onDoubleClick={() => {
-                  if (!isRen) (e.is_dir ? p.onOpen(e.name) : p.onExtract(e.name));
+                  if (!isRen) (e.is_dir ? p.onOpen(e.name) : p.onOpenFile(e.name));
                 }}
                 onDragStart={() => onDragStart(e.name)}
                 onDragOver={e.is_dir ? (ev) => onRowDragOver(ev, e.name) : undefined}
@@ -184,6 +185,19 @@ export default function FileTable(p: Props) {
                   {!e.is_dir && (
                     <button
                       className="small"
+                      title="Abrir"
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        p.onOpenFile(e.name);
+                      }}
+                    >
+                      📖
+                    </button>
+                  )}
+                  {!e.is_dir && (
+                    <button
+                      className="small"
+                      title="Extrair"
                       onClick={(ev) => {
                         ev.stopPropagation();
                         p.onExtract(e.name);
