@@ -91,10 +91,23 @@ uma geração — semente do versionamento.
       mostra resultados com o caminho. Ações por resultado: 📖 abrir, 📂 ir para a
       pasta (revela + realça), ⬇️ extrair, 🗑️ excluir.
 - [x] ABRIR ARQUIVO com o app padrão do SO: comando `open_file` extrai para
-      `temp/fsmanager-open/<nome>` e entrega ao sistema via `tauri-plugin-opener`
-      (chamado do Rust, fora do IPC — sem precisar de permissão extra). Duplo-clique
-      em arquivo agora ABRE (antes extraía); extrair virou ação explícita (botão
-      ⬇️ / menu). Obs.: o SO abre uma CÓPIA temporária — editar não regrava no cofre.
+      `temp/fsmanager-open/<subárvore lógica>` e entrega ao sistema via
+      `tauri-plugin-opener` (chamado do Rust, fora do IPC — sem permissão extra).
+      Duplo-clique em arquivo ABRE; extrair virou ação explícita (botão ⬇️ / menu).
+- [x] ABRIR-E-REGRAVAR: uma thread observadora (`spawn_watcher`, polling de 1s)
+      acompanha os arquivos temporários abertos (registrados em `AppState.watches`)
+      e, quando o usuário salva no app do SO (muda mtime/tamanho), reimporta o
+      conteúdo de volta para o cofre (`write_file`+`commit`) e emite `vault-changed`
+      → a UI atualiza e mostra "💾 salvo no cofre". Watches são limpos ao trocar/
+      fechar/montar o cofre. Temp em subárvore lógica evita colisão de nomes iguais.
+      Botão "👁️ Parar de observar (N)" na toolbar (`watch_count`/`stop_watching`).
+- [x] DESMONTE GRACIOSO (corrige letra "fantasma"): matar o `fsm-mount` à força
+      (TerminateProcess) deixava a letra presa porque o WinFsp não desmontava.
+      Agora o processo é iniciado com stdin em pipe e o `fsm-mount` desmonta ao
+      receber EOF nesse stdin; `unmount_drive` (async) fecha o stdin, espera sair
+      (até 5s) e só mata como fallback. A letra some como ejetar um pendrive.
+- [x] PASTAS mostram tamanho/data AGREGADOS: `list_dir` soma os tamanhos dos
+      arquivos sob cada subpasta e usa o mtime mais recente (antes era sempre "—").
 - [x] UI BUSCA + ORDENAÇÃO + DRAG DE PASTAS: filtro por nome na pasta atual
       (substring, client-side, no cabeçalho do painel); ordenação clicável por
       coluna (Nome/Tamanho/Modificado, com seta ▲/▼, pastas sempre primeiro);

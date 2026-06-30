@@ -82,6 +82,8 @@ export const api = {
 
   extractFile: (logical: string) => invoke<string | null>("extract_file", { logical }),
   openFile: (logical: string) => invoke<void>("open_file", { logical }),
+  watchCount: () => invoke<number>("watch_count"),
+  stopWatching: () => invoke<void>("stop_watching"),
   extractFiles: (paths: string[]) => invoke<string | null>("extract_files", { paths }),
 
   removePath: (logical: string, recursive: boolean) => invoke<void>("remove_path", { logical, recursive }),
@@ -106,6 +108,11 @@ export const api = {
 
 export function onAddProgress(cb: (p: AddProgress) => void): Promise<UnlistenFn> {
   return listen<AddProgress>("add-progress", (e) => cb(e.payload));
+}
+
+// "abrir-e-regravar": disparado quando um arquivo aberto foi salvo de volta no cofre.
+export function onVaultChanged(cb: (logical: string) => void): Promise<UnlistenFn> {
+  return listen<string>("vault-changed", (e) => cb(e.payload));
 }
 
 // Eventos de drag-and-drop do SO (nomes variam entre versões do Tauri).

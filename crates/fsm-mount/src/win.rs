@@ -691,10 +691,25 @@ pub fn mount(vault_path: &str, mountpoint: &str, password: Option<&str>) -> Resu
     println!("montado em {mountpoint} (leitura e escrita). Ctrl+C para desmontar.");
 
     let (tx, rx) = std::sync::mpsc::channel();
+    let tx_ctrlc = tx.clone();
     ctrlc::set_handler(move || {
-        let _ = tx.send(());
+        let _ = tx_ctrlc.send(());
     })
     .ok();
+    // Desmonte gracioso pedido pelo processo-pai (UI): quando ELE fecha o nosso
+    // stdin, recebemos EOF e desmontamos limpo — assim o WinFsp libera a letra
+    // (matar o processo à força deixaria a letra "fantasma").
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut byte = [0u8; 1];
+        loop {
+            match std::io::stdin().read(&mut byte) {
+                Ok(0) | Err(_) => break,  // EOF/erro: pai fechou o stdin
+                Ok(_) => continue,        // ignora dados digitados (uso via CLI)
+            }
+        }
+        let _ = tx.send(());
+    });
     let _ = rx.recv();
 
     println!("desmontando…");

@@ -5,10 +5,12 @@ import styles from "./Toolbar.module.css";
 interface Props {
   path: string;
   clipboardCount: number;
+  watchCount: number;
   onNavigate: (p: string) => void;
   onAdd: () => void;
   onNewFolder: () => void;
   onPaste: () => void;
+  onStopWatching: () => void;
   onManage: () => void;
   onMount: () => void;
   onGc: () => void;
@@ -64,6 +66,15 @@ export default function Toolbar(p: Props) {
         </button>
         <button onClick={p.onNewFolder}>📁 Nova pasta</button>
         {p.clipboardCount > 0 && <button onClick={p.onPaste}>📋 Colar ({p.clipboardCount})</button>}
+        {p.watchCount > 0 && (
+          <button
+            className={styles.watching}
+            title="Arquivos abertos sendo observados — clique para parar de regravar ao salvar"
+            onClick={p.onStopWatching}
+          >
+            👁️ Parar de observar ({p.watchCount})
+          </button>
+        )}
         <button onClick={p.onManage}>⚙️ Gerenciar</button>
         <button onClick={p.onMount}>🔌 Montar</button>
         <button onClick={p.onGc}>🧹 Compactar</button>

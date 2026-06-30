@@ -6,6 +6,7 @@ import {
   joinPath,
   onAddProgress,
   onOsDrag,
+  onVaultChanged,
   type DirEntry,
   type SearchHit,
   type VaultInfo,
@@ -46,6 +47,7 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
   const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" }>({ key: "name", dir: "asc" });
   const [scope, setScope] = useState<"folder" | "vault">("folder");
   const [results, setResults] = useState<SearchHit[]>([]);
+  const [watchCount, setWatchCount] = useState(0);
 
   const toast = useToast();
   const openMenu = useContextMenu();
@@ -168,6 +170,11 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
         });
       },
     }).then((us) => us.forEach(track));
+    onVaultChanged((logical) => {
+      refresh();
+      const base = logical.split("/").pop() || logical;
+      toast(`💾 ${base} salvo no cofre`);
+    }).then(track);
     return () => {
       active = false;
       unsubs.forEach((u) => u());
@@ -252,7 +259,14 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
   const openFileEntry = (name: string) =>
     guarded(async () => {
       await api.openFile(joinPath(path, name));
-      toast("abrindo com o app padrão…");
+      setWatchCount(await api.watchCount());
+      toast("abrindo… o que você salvar volta pro cofre");
+    });
+  const stopWatching = () =>
+    guarded(async () => {
+      await api.stopWatching();
+      setWatchCount(0);
+      toast("parou de observar os arquivos abertos");
     });
   const extractOne = (name: string) =>
     guarded(async () => {
@@ -284,7 +298,8 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
   const openHit = (p: string) =>
     guarded(async () => {
       await api.openFile(p);
-      toast("abrindo com o app padrão…");
+      setWatchCount(await api.watchCount());
+      toast("abrindo… o que você salvar volta pro cofre");
     });
   const extractHit = (p: string) =>
     guarded(async () => {
@@ -478,10 +493,12 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
       <Toolbar
         path={path}
         clipboardCount={clipboard.length}
+        watchCount={watchCount}
         onNavigate={navigate}
         onAdd={addFilesHere}
         onNewFolder={() => setPendingNew("dir")}
         onPaste={doPaste}
+        onStopWatching={stopWatching}
         onManage={() => setManageOpen(true)}
         onMount={doMount}
         onGc={doGc}

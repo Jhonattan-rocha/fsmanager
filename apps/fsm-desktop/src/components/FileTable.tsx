@@ -179,8 +179,8 @@ export default function FileTable(p: Props) {
                     e.name
                   )}
                 </td>
-                <td className={styles.num}>{e.is_dir ? "—" : fmtBytes(e.size)}</td>
-                <td className={`${styles.num} ${styles.dim}`}>{e.is_dir ? "—" : fmtDate(e.mtime)}</td>
+                <td className={styles.num}>{e.is_dir && e.size === 0 ? "—" : fmtBytes(e.size)}</td>
+                <td className={`${styles.num} ${styles.dim}`}>{fmtDate(e.mtime)}</td>
                 <td className={styles.rowActions}>
                   {!e.is_dir && (
                     <button

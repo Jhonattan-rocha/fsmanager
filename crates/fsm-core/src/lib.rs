@@ -881,7 +881,8 @@ impl Vault {
     pub fn list_dir(&self, path: &str) -> Vec<DirEntry> {
         let p = normalize_path(path);
         let pre = if p == "/" { "/".to_string() } else { format!("{p}/") };
-        let mut subdirs: BTreeSet<String> = BTreeSet::new();
+        // Por subpasta imediata: (soma de tamanhos, mtime mais recente).
+        let mut subdirs: BTreeMap<String, (u64, i64)> = BTreeMap::new();
         let mut entries: Vec<DirEntry> = Vec::new();
         for (k, e) in &self.catalog.files {
             if !k.starts_with(&pre) {
@@ -899,11 +900,14 @@ impl Vault {
                     mtime: e.mtime,
                 }),
                 Some(i) => {
-                    subdirs.insert(rest[..i].to_string());
+                    // Agrega o arquivo na subpasta imediata.
+                    let agg = subdirs.entry(rest[..i].to_string()).or_insert((0, 0));
+                    agg.0 = agg.0.saturating_add(e.size);
+                    agg.1 = agg.1.max(e.mtime);
                 }
             }
         }
-        // Diretórios explícitos: filhos imediatos e ancestrais sob o prefixo.
+        // Diretórios explícitos: garante presença (mesmo vazios, com 0/0).
         for d in &self.catalog.dirs {
             if !d.starts_with(&pre) {
                 continue;
@@ -916,14 +920,14 @@ impl Vault {
                 None => rest,
                 Some(i) => &rest[..i],
             };
-            subdirs.insert(name.to_string());
+            subdirs.entry(name.to_string()).or_insert((0, 0));
         }
-        for d in subdirs {
+        for (name, (size, mtime)) in subdirs {
             entries.push(DirEntry {
-                name: d,
+                name,
                 is_dir: true,
-                size: 0,
-                mtime: 0,
+                size,
+                mtime,
             });
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));

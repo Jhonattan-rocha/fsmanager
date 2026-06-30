@@ -4,12 +4,15 @@
 //! para reusar a chave derivada (Argon2) entre operações — abrir um cofre
 //! cifrado a cada clique seria inviável.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime};
 
 use fsm_core::{NodeKind, Vault, DEFAULT_AVG_CHUNK};
 use serde::Serialize;
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 /// Vault aberto + contexto necessário para reabrir após `gc`.
@@ -19,10 +22,26 @@ struct OpenVault {
     vault: Vault,
 }
 
+/// Arquivo aberto pelo SO (open_file) sendo observado para reimportar ao salvar.
+struct WatchEntry {
+    logical: String,
+    mtime: Option<SystemTime>,
+    size: u64,
+}
+
 #[derive(Default)]
 struct AppState {
     open: Mutex<Option<OpenVault>>,
     mount: Mutex<Option<MountProc>>,
+    /// caminho-temp -> info do arquivo aberto, para o "abrir-e-regravar".
+    watches: Mutex<HashMap<PathBuf, WatchEntry>>,
+}
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Processo `fsm-mount` em execução (binário GPLv3 separado, invocado como processo).
@@ -237,6 +256,7 @@ fn create_vault(
     }
     .map_err(s)?;
     let info = build_info(&path, &vault);
+    state.watches.lock().unwrap().clear();
     *state.open.lock().unwrap() = Some(OpenVault { path, password: pw, vault });
     Ok(info)
 }
@@ -259,12 +279,14 @@ fn open_vault(
     let pw = empty_to_none(password);
     let vault = Vault::open(&path, pw.as_deref()).map_err(s)?;
     let info = build_info(&path, &vault);
+    state.watches.lock().unwrap().clear();
     *state.open.lock().unwrap() = Some(OpenVault { path, password: pw, vault });
     Ok(info)
 }
 
 #[tauri::command]
 fn close_vault(state: State<AppState>) -> Result<(), String> {
+    state.watches.lock().unwrap().clear();
     *state.open.lock().unwrap() = None;
     Ok(())
 }
@@ -332,11 +354,7 @@ fn new_file(state: State<AppState>, path: String) -> Result<(), String> {
         if v.resolve(&path).is_some() {
             return Err("já existe um item com esse nome".into());
         }
-        let mtime = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        v.write_file(&path, &[], mtime).map_err(s)?;
+        v.write_file(&path, &[], now_secs()).map_err(s)?;
         v.commit().map_err(s)
     })
 }
@@ -426,20 +444,48 @@ fn open_file(
     logical: String,
 ) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
-    let name = logical.rsplit('/').next().unwrap_or("arquivo").to_string();
     let dir = std::env::temp_dir().join("fsmanager-open");
-    std::fs::create_dir_all(&dir).map_err(s)?;
-    let out = dir.join(&name);
+    // Recria a subárvore lógica no temp: evita colisão entre nomes iguais de
+    // pastas diferentes e preserva o nome real do arquivo para o app do SO.
+    let rel = logical.trim_start_matches('/');
+    let out = dir.join(rel);
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).map_err(s)?;
+    }
     {
         let guard = state.open.lock().unwrap();
         let ov = guard.as_ref().ok_or("nenhum container aberto")?;
         let mut f = std::fs::File::create(&out).map_err(s)?;
         ov.vault.extract(&logical, &mut f).map_err(s)?;
     }
+    // Registra para "abrir-e-regravar": a thread observadora reimporta ao salvar.
+    let key = std::fs::canonicalize(&out).unwrap_or_else(|_| out.clone());
+    if let Ok(meta) = std::fs::metadata(&out) {
+        state.watches.lock().unwrap().insert(
+            key,
+            WatchEntry {
+                logical: logical.clone(),
+                mtime: meta.modified().ok(),
+                size: meta.len(),
+            },
+        );
+    }
     app.opener()
         .open_path(out.to_string_lossy().to_string(), None::<&str>)
         .map_err(s)?;
     Ok(())
+}
+
+/// Quantos arquivos abertos estão sendo observados (abrir-e-regravar).
+#[tauri::command]
+fn watch_count(state: State<AppState>) -> usize {
+    state.watches.lock().unwrap().len()
+}
+
+/// Para de observar todos os arquivos abertos (não reimporta mais ao salvar).
+#[tauri::command]
+fn stop_watching(state: State<AppState>) {
+    state.watches.lock().unwrap().clear();
 }
 
 #[tauri::command]
@@ -728,6 +774,7 @@ fn mount_drive(state: State<AppState>, mountpoint: String) -> Result<String, Str
     let bin = resolve_mount_bin()?;
 
     // Fecha o vault na UI ANTES de montar (evita dois escritores no mesmo arquivo).
+    state.watches.lock().unwrap().clear();
     *state.open.lock().unwrap() = None;
 
     let mut cmd = std::process::Command::new(&bin);
@@ -735,6 +782,8 @@ fn mount_drive(state: State<AppState>, mountpoint: String) -> Result<String, Str
     if let Some(pw) = &password {
         cmd.arg("--password").arg(pw);
     }
+    // stdin em pipe: fechá-lo depois sinaliza o desmonte gracioso (libera a letra).
+    cmd.stdin(Stdio::piped());
     let child = cmd
         .spawn()
         .map_err(|e| format!("falha ao iniciar {}: {e}", bin.display()))?;
@@ -745,11 +794,29 @@ fn mount_drive(state: State<AppState>, mountpoint: String) -> Result<String, Str
     Ok(mountpoint)
 }
 
-/// Desmonta o drive: encerra o processo `fsm-mount`.
-#[tauri::command]
+/// Desmonta o drive de forma GRACIOSA: fecha o stdin do `fsm-mount` (ele
+/// desmonta o WinFsp e libera a letra), espera sair, e só mata como fallback.
+#[tauri::command(async)]
 fn unmount_drive(state: State<AppState>) -> Result<(), String> {
-    if let Some(mut m) = state.mount.lock().unwrap().take() {
-        let _ = m.child.kill();
+    // Tira do estado primeiro (não segura o Mutex durante a espera).
+    let m = state.mount.lock().unwrap().take();
+    if let Some(mut m) = m {
+        // Fecha o stdin → fsm-mount recebe EOF e desmonta limpo.
+        drop(m.child.stdin.take());
+        // Espera o desmonte limpo (até 5s); se travar, mata como último recurso.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match m.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                _ => {
+                    let _ = m.child.kill();
+                    break;
+                }
+            }
+        }
         let _ = m.child.wait();
     }
     Ok(())
@@ -766,11 +833,63 @@ fn mount_status(state: State<AppState>) -> Option<String> {
         .map(|m| m.mountpoint.clone())
 }
 
+/// Thread observadora do "abrir-e-regravar": a cada 1s checa os arquivos
+/// temporários abertos via `open_file` e, se mudaram (o usuário salvou no app
+/// do SO), reimporta o conteúdo de volta para o cofre e avisa a UI.
+fn spawn_watcher(app: tauri::AppHandle) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(1000));
+        let state = app.state::<AppState>();
+        let mut changed: Vec<(String, Vec<u8>)> = Vec::new();
+        {
+            let mut watches = state.watches.lock().unwrap();
+            for (path, w) in watches.iter_mut() {
+                let Ok(meta) = std::fs::metadata(path) else {
+                    continue;
+                };
+                let size = meta.len();
+                let mtime = meta.modified().ok();
+                if size != w.size || mtime != w.mtime {
+                    w.size = size;
+                    w.mtime = mtime;
+                    if let Ok(bytes) = std::fs::read(path) {
+                        changed.push((w.logical.clone(), bytes));
+                    }
+                }
+            }
+        }
+        if changed.is_empty() {
+            continue;
+        }
+        let mut guard = state.open.lock().unwrap();
+        let Some(ov) = guard.as_mut() else {
+            continue; // cofre fechado: ignora
+        };
+        let mut saved: Vec<String> = Vec::new();
+        for (logical, bytes) in changed {
+            if ov.vault.write_file(&logical, &bytes, now_secs()).is_ok() {
+                saved.push(logical);
+            }
+        }
+        if !saved.is_empty() {
+            let _ = ov.vault.commit();
+        }
+        drop(guard);
+        for logical in saved {
+            let _ = app.emit("vault-changed", &logical);
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            spawn_watcher(app.handle().clone());
+            Ok(())
+        })
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             create_vault,
@@ -787,6 +906,8 @@ pub fn run() {
             extract_file,
             extract_files,
             open_file,
+            watch_count,
+            stop_watching,
             remove_path,
             remove_paths,
             move_paths,

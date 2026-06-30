@@ -38,3 +38,7 @@
   outline: 2px solid var(--accent);
   background: color-mix(in srgb, var(--accent) 20%, transparent);
 }
+.watching {
+  border-color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 14%, var(--panel-2));
+}
