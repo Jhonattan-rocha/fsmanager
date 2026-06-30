@@ -274,6 +274,22 @@ fn make_dir(state: State<AppState>, path: String) -> Result<(), String> {
     })
 }
 
+/// Cria um arquivo vazio (não sobrescreve um item existente).
+#[tauri::command]
+fn new_file(state: State<AppState>, path: String) -> Result<(), String> {
+    with_vault(&state, |v| {
+        if v.resolve(&path).is_some() {
+            return Err("já existe um item com esse nome".into());
+        }
+        let mtime = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        v.write_file(&path, &[], mtime).map_err(s)?;
+        v.commit().map_err(s)
+    })
+}
+
 /// Abre um seletor de arquivos e adiciona os escolhidos dentro de `dest_dir`.
 #[tauri::command(async)]
 fn add_files(
@@ -672,6 +688,7 @@ pub fn run() {
             get_info,
             list_dir,
             make_dir,
+            new_file,
             add_files,
             add_dropped,
             extract_file,

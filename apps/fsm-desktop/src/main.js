@@ -254,6 +254,29 @@ function doPaste() {
 function clearDropTargets() {
   document.querySelectorAll(".drop-target").forEach((el) => el.classList.remove("drop-target"));
 }
+function addFilesHere() {
+  guarded(async () => {
+    showProgress();
+    try {
+      const n = await call("add_files", { destDir: currentPath });
+      await refresh();
+      if (n > 0) toast(`${n} arquivo(s) adicionado(s)`);
+    } finally {
+      hideProgress();
+    }
+  });
+}
+// Menu de contexto da área vazia (fundo da árvore de arquivos).
+function backgroundMenuItems() {
+  const items = [
+    { label: "📁 Nova pasta", fn: () => startInlineNew("dir") },
+    { label: "📄 Novo arquivo", fn: () => startInlineNew("file") },
+    { label: "➕ Adicionar arquivos…", fn: addFilesHere },
+  ];
+  if (clipboard.length) items.push({ label: `📋 Colar (${clipboard.length})`, fn: doPaste });
+  if (lastEntries.length) items.push({ label: "☑️ Selecionar tudo", fn: selectAll });
+  return items;
+}
 
 function renderStats(s) {
   const lock = s.encrypted ? "🔒 cifrado" : "🔓 aberto";
@@ -346,11 +369,16 @@ function showCtx(x, y, items) {
 }
 
 // ----------------------- edição inline (estilo Explorer) -----------------------
-function startInlineNew() {
+function startInlineNew(kind = "dir") {
+  const isDir = kind === "dir";
+  const icon = isDir ? "📁" : "📄";
+  const ph = isDir ? "nome da pasta" : "nome do arquivo";
   const tbody = $("fileList");
+  // Remove o placeholder "pasta vazia" para não conviver com o editor.
+  if (tbody.querySelector("td.empty")) tbody.innerHTML = "";
   const tr = document.createElement("tr");
   tr.className = "editing-row";
-  tr.innerHTML = `<td class="name is-dir">📁 <input class="inline-edit" placeholder="nome da pasta" /></td><td class="num">—</td><td class="num">—</td><td></td>`;
+  tr.innerHTML = `<td class="name ${isDir ? "is-dir" : ""}">${icon} <input class="inline-edit" placeholder="${ph}" /></td><td class="num">—</td><td class="num">—</td><td></td>`;
   tbody.prepend(tr);
   const input = tr.querySelector("input");
   input.focus();
@@ -362,10 +390,14 @@ function startInlineNew() {
     tr.remove();
     if (save && nome) {
       await guarded(async () => {
-        await call("make_dir", { path: joinPath(currentPath, nome) });
+        const path = joinPath(currentPath, nome);
+        if (isDir) await call("make_dir", { path });
+        else await call("new_file", { path });
         await refresh();
-        toast("pasta criada");
+        toast(isDir ? "pasta criada" : "arquivo criado");
       });
+    } else if (!save) {
+      await refresh(); // restaura o placeholder se cancelou em pasta vazia
     }
   };
   input.addEventListener("keydown", (e) => {
@@ -496,19 +528,7 @@ window.addEventListener("DOMContentLoaded", () => {
       showWelcome();
     })
   );
-  $("btnAdd").addEventListener("click", () =>
-    guarded(async () => {
-      const dest = currentPath;
-      showProgress();
-      try {
-        const n = await call("add_files", { destDir: dest });
-        await refresh();
-        if (n > 0) toast(`${n} arquivo(s) adicionado(s)`);
-      } finally {
-        hideProgress();
-      }
-    })
-  );
+  $("btnAdd").addEventListener("click", addFilesHere);
   $("btnNewFolder").addEventListener("click", () => {
     if (vaultOpen) startInlineNew();
   });
@@ -748,10 +768,15 @@ window.addEventListener("DOMContentLoaded", () => {
     const acts = entryActions(tr.dataset.name, isDir);
     isDir ? acts.open() : acts.extract();
   });
-  $("fileList").addEventListener("contextmenu", (e) => {
-    const tr = e.target.closest("tr[data-name]");
-    if (!tr) return;
+  $("fileArea").addEventListener("contextmenu", (e) => {
     e.preventDefault();
+    const tr = e.target.closest("tr[data-name]");
+    // Área vazia (fundo da árvore): menu de criação/ações rápidas.
+    if (!tr) {
+      clearSelection();
+      showCtx(e.clientX, e.clientY, backgroundMenuItems());
+      return;
+    }
     const name = tr.dataset.name;
     // Clique direito sobre item fora da seleção: seleciona só ele.
     if (!selected.has(name)) {
