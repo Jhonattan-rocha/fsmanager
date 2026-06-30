@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type DragEvent, type MouseEvent } from "react";
 import { fmtBytes, fmtDate, joinPath, type DirEntry } from "../api";
 import { dragState } from "../dragState";
-import type { NewKind } from "./Workspace";
+import type { NewKind, SortKey } from "./Workspace";
 import styles from "./FileTable.module.css";
 
 type SelectMods = { shiftKey: boolean; ctrlKey: boolean; metaKey: boolean };
@@ -10,6 +10,8 @@ interface Props {
   entries: DirEntry[];
   selected: Set<string>;
   currentPath: string;
+  sort: { key: SortKey; dir: "asc" | "desc" };
+  onSort: (key: SortKey) => void;
   pendingNew: NewKind | null;
   renaming: string | null;
   onSelect: (name: string, mods: SelectMods) => void;
@@ -67,6 +69,7 @@ function InlineInput({
 
 export default function FileTable(p: Props) {
   const [dropTarget, setDropTarget] = useState<string | null>(null);
+  const arrow = (key: SortKey) => (p.sort.key === key ? (p.sort.dir === "asc" ? " ▲" : " ▼") : "");
 
   const onDragStart = (name: string) => {
     const names = p.selected.has(name) ? [...p.selected] : [name];
@@ -106,9 +109,15 @@ export default function FileTable(p: Props) {
       <table>
         <thead>
           <tr>
-            <th>Nome</th>
-            <th className={styles.num}>Tamanho</th>
-            <th className={styles.num}>Modificado</th>
+            <th className={styles.sortable} onClick={() => p.onSort("name")}>
+              Nome{arrow("name")}
+            </th>
+            <th className={`${styles.num} ${styles.sortable}`} onClick={() => p.onSort("size")}>
+              Tamanho{arrow("size")}
+            </th>
+            <th className={`${styles.num} ${styles.sortable}`} onClick={() => p.onSort("mtime")}>
+              Modificado{arrow("mtime")}
+            </th>
             <th></th>
           </tr>
         </thead>

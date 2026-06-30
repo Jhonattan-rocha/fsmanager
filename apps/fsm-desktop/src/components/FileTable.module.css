@@ -18,6 +18,14 @@
   text-transform: uppercase;
   letter-spacing: 0.4px;
 }
+.sortable {
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.sortable:hover {
+  color: var(--text);
+}
 .tableWrap tbody td {
   padding: 8px 14px;
   border-bottom: 1px solid var(--border);

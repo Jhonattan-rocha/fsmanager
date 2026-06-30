@@ -21,6 +21,7 @@ import Progress from "./Progress";
 import styles from "./Workspace.module.css";
 
 export type NewKind = "dir" | "file";
+export type SortKey = "name" | "size" | "mtime";
 
 interface Props {
   initialInfo: VaultInfo;
@@ -39,21 +40,37 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
   const [dragOver, setDragOver] = useState(false);
   const [pendingNew, setPendingNew] = useState<NewKind | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
+  const [filter, setFilter] = useState("");
+  const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" }>({ key: "name", dir: "asc" });
 
   const toast = useToast();
   const openMenu = useContextMenu();
   const pathRef = useRef("/");
   const lastClicked = useRef<string | null>(null);
 
-  // Pastas primeiro, depois arquivos; alfabético. Ordem usada na seleção e no render.
-  const sorted = useMemo(
-    () =>
-      [...entries].sort((a, b) => {
-        if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
-        return a.name.localeCompare(b.name);
-      }),
-    [entries]
-  );
+  // Pastas sempre primeiro; dentro do grupo, ordena pela coluna ativa.
+  const sorted = useMemo(() => {
+    const arr = [...entries];
+    arr.sort((a, b) => {
+      if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
+      let r = 0;
+      if (sort.key === "name") r = a.name.localeCompare(b.name);
+      else if (sort.key === "size") r = a.size - b.size;
+      else r = a.mtime - b.mtime;
+      if (r === 0) r = a.name.localeCompare(b.name);
+      return sort.dir === "asc" ? r : -r;
+    });
+    return arr;
+  }, [entries, sort]);
+
+  // Filtro por nome (substring, case-insensitive) na pasta atual.
+  const visible = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    return q ? sorted.filter((e) => e.name.toLowerCase().includes(q)) : sorted;
+  }, [sorted, filter]);
+
+  const onSort = (key: SortKey) =>
+    setSort((s) => (s.key === key ? { key, dir: s.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" }));
 
   const refresh = useCallback(async (p?: string) => {
     const target = p ?? pathRef.current;
@@ -86,6 +103,7 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
   };
   const navigate = (p: string) => {
     clearSel();
+    setFilter("");
     const np = p || "/";
     setPathSynced(np);
     refresh(np);
@@ -130,7 +148,7 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
 
   // ---- seleção ----
   const handleSelect = (name: string, e: { shiftKey: boolean; ctrlKey: boolean; metaKey: boolean }) => {
-    const names = sorted.map((x) => x.name);
+    const names = visible.map((x) => x.name);
     setSelected((prev) => {
       const next = new Set(prev);
       if (e.shiftKey && lastClicked.current) {
@@ -153,7 +171,7 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
     });
   };
   const selectedPaths = () => [...selected].map((n) => joinPath(path, n));
-  const selectAll = () => setSelected(new Set(sorted.map((x) => x.name)));
+  const selectAll = () => setSelected(new Set(visible.map((x) => x.name)));
 
   // ---- ações sobre caminhos explícitos ----
   const extractPaths = (paths: string[]) =>
@@ -252,6 +270,17 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
         setProgress(null);
       }
     });
+  const addFolderHere = () =>
+    guarded(async () => {
+      setProgress({ label: "Adicionando pasta…", pct: 0 });
+      try {
+        const n = await api.addFolder(path);
+        await refresh();
+        if (n > 0) toast(`${n} arquivo(s) da pasta adicionado(s)`);
+      } finally {
+        setProgress(null);
+      }
+    });
   const doMount = () =>
     guarded(async () => {
       const isWin = navigator.userAgent.includes("Windows");
@@ -342,9 +371,10 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
       { label: "📁 Nova pasta", onClick: () => setPendingNew("dir") },
       { label: "📄 Novo arquivo", onClick: () => setPendingNew("file") },
       { label: "➕ Adicionar arquivos…", onClick: addFilesHere },
+      { label: "📂 Adicionar pasta…", onClick: addFolderHere },
     ];
     if (clipboard.length) items.push({ label: `📋 Colar (${clipboard.length})`, onClick: doPaste });
-    if (sorted.length) items.push({ label: "☑️ Selecionar tudo", onClick: selectAll });
+    if (visible.length) items.push({ label: "☑️ Selecionar tudo", onClick: selectAll });
     openMenu(x, y, items);
   };
 
@@ -372,7 +402,7 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected, clipboard, sorted, manageOpen]);
+  }, [selected, clipboard, visible, manageOpen]);
 
   return (
     <main className={styles.workspace}>
@@ -401,10 +431,23 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
       )}
       <div className={styles.panels}>
         <div className={styles.panel}>
+          <div className={styles.panelHead}>
+            <input
+              className={styles.filter}
+              placeholder="🔎 filtrar nesta pasta…"
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+            />
+            <span className="sub">
+              {filter ? `${visible.length} de ${sorted.length}` : `${sorted.length} item(ns)`}
+            </span>
+          </div>
           <FileTable
-            entries={sorted}
+            entries={visible}
             selected={selected}
             currentPath={path}
+            sort={sort}
+            onSort={onSort}
             pendingNew={pendingNew}
             renaming={renaming}
             onSelect={handleSelect}

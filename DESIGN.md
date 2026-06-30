@@ -83,6 +83,12 @@ uma geração — semente do versionamento.
       sistema de botões/inputs) + **CSS Modules por componente**. Drag interno
       compartilha estado via singleton de módulo `dragState`. `npm install` é
       pré-requisito do build (os scripts já chamam).
+- [x] UI BUSCA + ORDENAÇÃO + DRAG DE PASTAS: filtro por nome na pasta atual
+      (substring, client-side, no cabeçalho do painel); ordenação clicável por
+      coluna (Nome/Tamanho/Modificado, com seta ▲/▼, pastas sempre primeiro);
+      drag-drop de PASTAS externas agora recursa — `collect_pairs` no backend
+      expande a subárvore preservando a estrutura sob o destino (`add_dropped`
+      não filtra mais só arquivos; comando `add_folder` abre seletor de pasta).
 - [x] UI SELEÇÃO MÚLTIPLA + AÇÕES EM LOTE: clique/Ctrl-clique/Shift-clique
       seleciona; barra de lote (extrair/mover/excluir) + menu de contexto ciente
       da seleção. Comandos `remove_paths`/`move_paths`/`extract_files` fazem N

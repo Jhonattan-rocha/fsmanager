@@ -149,30 +149,57 @@ fn join_logical(dir: &str, name: &str) -> String {
 
 /// Adiciona `sources` (caminhos do disco) dentro de `dest_dir`, emitindo
 /// progresso. Retorna quantos arquivos foram adicionados.
+/// Coleta pares (caminho-em-disco, caminho-lógico) para um item solto,
+/// RECURSIVAMENTE em pastas — preservando a subárvore dentro de `dest_dir`.
+fn collect_pairs(src: &Path, dest_dir: &str, out: &mut Vec<(String, String)>) {
+    if src.is_file() {
+        let name = src
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "arquivo".into());
+        out.push((src.to_string_lossy().into_owned(), join_logical(dest_dir, &name)));
+    } else if src.is_dir() {
+        let folder = src
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "pasta".into());
+        let sub = join_logical(dest_dir, &folder);
+        if let Ok(rd) = std::fs::read_dir(src) {
+            for entry in rd.flatten() {
+                collect_pairs(&entry.path(), &sub, out);
+            }
+        }
+    }
+}
+
 fn add_sources(
     app: &tauri::AppHandle,
     ov: &mut OpenVault,
     sources: &[String],
     dest_dir: &str,
 ) -> Result<usize, String> {
+    // Expande pastas em seus arquivos (recursivo), preservando a estrutura.
+    let mut pairs: Vec<(String, String)> = Vec::new();
     for src in sources {
-        let name = Path::new(src)
+        collect_pairs(Path::new(src), dest_dir, &mut pairs);
+    }
+    for (disk, logical) in &pairs {
+        let fname = Path::new(logical)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "arquivo".into());
-        let dest = join_logical(dest_dir, &name);
-        let total = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+        let total = std::fs::metadata(disk).map(|m| m.len()).unwrap_or(0);
         let app2 = app.clone();
-        let fname = name.clone();
+        let label = fname.clone();
         let mut last_emit = 0u64;
         ov.vault
-            .add_file_progress(src, &dest, |done| {
+            .add_file_progress(disk, logical, |done| {
                 if done.saturating_sub(last_emit) >= 4 * 1024 * 1024 || done >= total {
                     last_emit = done;
                     let _ = app2.emit(
                         "add-progress",
                         AddProgress {
-                            file: fname.clone(),
+                            file: label.clone(),
                             done,
                             total,
                         },
@@ -182,7 +209,7 @@ fn add_sources(
             .map_err(s)?;
     }
     ov.vault.commit().map_err(s)?;
-    Ok(sources.len())
+    Ok(pairs.len())
 }
 
 // ----------------------- comandos -----------------------
@@ -308,6 +335,23 @@ fn add_files(
     add_sources(&app, ov, &sources, &dest_dir)
 }
 
+/// Abre um seletor de PASTA e adiciona seu conteúdo (recursivo) em `dest_dir`.
+#[tauri::command(async)]
+fn add_folder(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    dest_dir: String,
+) -> Result<usize, String> {
+    let chosen = app.dialog().file().blocking_pick_folder();
+    let folder = match chosen {
+        Some(p) => p.to_string(),
+        None => return Ok(0),
+    };
+    let mut guard = state.open.lock().unwrap();
+    let ov = guard.as_mut().ok_or("nenhum container aberto")?;
+    add_sources(&app, ov, &[folder], &dest_dir)
+}
+
 /// Adiciona arquivos arrastados (drag-and-drop) dentro de `dest_dir`.
 #[tauri::command(async)]
 fn add_dropped(
@@ -316,16 +360,13 @@ fn add_dropped(
     paths: Vec<String>,
     dest_dir: String,
 ) -> Result<usize, String> {
-    let sources: Vec<String> = paths
-        .into_iter()
-        .filter(|p| Path::new(p).is_file())
-        .collect();
-    if sources.is_empty() {
-        return Ok(0); // só pastas / nada válido: no-op (pastas ainda não recursam)
+    // Aceita arquivos E pastas — pastas são adicionadas recursivamente.
+    if paths.is_empty() {
+        return Ok(0);
     }
     let mut guard = state.open.lock().unwrap();
     let ov = guard.as_mut().ok_or("nenhum container aberto")?;
-    add_sources(&app, ov, &sources, &dest_dir)
+    add_sources(&app, ov, &paths, &dest_dir)
 }
 
 #[tauri::command(async)]
@@ -690,6 +731,7 @@ pub fn run() {
             make_dir,
             new_file,
             add_files,
+            add_folder,
             add_dropped,
             extract_file,
             extract_files,

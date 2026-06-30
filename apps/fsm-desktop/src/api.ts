@@ -69,6 +69,7 @@ export const api = {
   newFile: (path: string) => invoke<void>("new_file", { path }),
 
   addFiles: (destDir: string) => invoke<number>("add_files", { destDir }),
+  addFolder: (destDir: string) => invoke<number>("add_folder", { destDir }),
   addDropped: (paths: string[], destDir: string) => invoke<number>("add_dropped", { paths, destDir }),
 
   extractFile: (logical: string) => invoke<string | null>("extract_file", { logical }),

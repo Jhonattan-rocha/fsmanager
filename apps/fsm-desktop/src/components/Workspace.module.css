@@ -27,6 +27,20 @@
   min-height: 0;
   overflow: hidden;
 }
+.panelHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.filter {
+  padding: 6px 10px;
+  font-size: 13px;
+  width: 220px;
+  max-width: 60%;
+}
 .dropOverlay {
   position: fixed;
   inset: 0;
