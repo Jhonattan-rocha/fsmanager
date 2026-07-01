@@ -51,7 +51,13 @@ pub const HEADER_SIZE: u64 = 4096;
 /// os blocos seguintes, então o dedup sobrevive a inserções/edições.
 pub const DEFAULT_AVG_CHUNK: u32 = 64 * 1024;
 /// Versão do formato on-disk.
-pub const FORMAT_VERSION: u32 = 8;
+/// Versão do formato GRAVADA. v9+ usa MessagePack com structs por NOME de campo:
+/// adicionar um campo novo (com `#[serde(default)]`) ou remover um NÃO quebra
+/// cofres existentes — a migração é transparente, sem bump de versão.
+pub const FORMAT_VERSION: u32 = 9;
+/// Versão mais antiga que ainda sabemos LER (migrada para a atual no 1º commit).
+/// v8 = catálogo em bincode (legado, posicional).
+pub const MIN_FORMAT_VERSION: u32 = 8;
 /// Nível de compressão zstd padrão (1..=22; 3 é o equilíbrio do zstd).
 pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
@@ -343,8 +349,10 @@ impl Vault {
             bail!("assinatura inválida — não é um container fsmanager");
         }
         let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
-        if version != FORMAT_VERSION {
-            bail!("versão de formato {version} não suportada (esperado {FORMAT_VERSION})");
+        if !(MIN_FORMAT_VERSION..=FORMAT_VERSION).contains(&version) {
+            bail!(
+                "versão de formato {version} não suportada (suportadas {MIN_FORMAT_VERSION}..={FORMAT_VERSION})"
+            );
         }
         let chunk_size = u32::from_le_bytes(header[12..16].try_into().unwrap());
         let catalog_offset = u64::from_le_bytes(header[16..24].try_into().unwrap());
@@ -381,8 +389,7 @@ impl Vault {
             Some(e) => unseal(&e.key, &buf).context("decifrando catálogo")?,
             None => buf,
         };
-        let catalog: Catalog =
-            bincode::deserialize(&raw).context("desserializando catálogo")?;
+        let catalog: Catalog = decode_catalog(version, &raw)?;
 
         Ok(Vault {
             file,
@@ -1309,7 +1316,7 @@ impl Vault {
             dirs: self.catalog.dirs.clone(),
             quota: self.catalog.quota,
         };
-        let raw = bincode::serialize(&new_catalog).context("serializando catálogo")?;
+        let raw = encode_catalog(&new_catalog)?;
         let bytes = match &self.enc {
             Some(e) => seal(&e.key, &raw).context("cifrando catálogo")?,
             None => raw,
@@ -1405,7 +1412,7 @@ impl Vault {
             dirs: self.catalog.dirs.clone(),
             quota: self.catalog.quota,
         };
-        let raw = bincode::serialize(&new_catalog).context("serializando catálogo")?;
+        let raw = encode_catalog(&new_catalog)?;
         let bytes = match &new_enc {
             Some(e) => seal(&e.key, &raw).context("cifrando catálogo")?,
             None => raw,
@@ -1426,7 +1433,7 @@ impl Vault {
     /// Ordem de durabilidade: grava catálogo → fsync → atualiza header → fsync.
     /// Se cair antes do header, o catálogo antigo continua válido.
     pub fn commit(&mut self) -> Result<()> {
-        let raw = bincode::serialize(&self.catalog).context("serializando catálogo")?;
+        let raw = encode_catalog(&self.catalog)?;
         let bytes = match &self.enc {
             Some(e) => seal(&e.key, &raw).context("cifrando catálogo")?,
             None => raw,
@@ -1545,6 +1552,25 @@ pub struct CompactReport {
 impl CompactReport {
     pub fn reclaimed_bytes(&self) -> u64 {
         self.bytes_before.saturating_sub(self.bytes_after)
+    }
+}
+
+/// Serializa o catálogo no formato ATUAL (v9): MessagePack com structs mapeados
+/// por NOME de campo. Isso torna o formato TOLERANTE: adicionar um campo novo
+/// (com `#[serde(default)]`) ou remover um campo antigo não impede ler cofres
+/// gravados por outra versão do app.
+fn encode_catalog(catalog: &Catalog) -> Result<Vec<u8>> {
+    rmp_serde::to_vec_named(catalog).context("serializando catálogo")
+}
+
+/// Desserializa o catálogo conforme a versão lida do header. v8 = bincode
+/// (legado, posicional); v9 = MessagePack. Um cofre v8 é lido aqui e MIGRADO
+/// para v9 automaticamente no próximo `commit` (que grava no formato atual).
+fn decode_catalog(version: u32, raw: &[u8]) -> Result<Catalog> {
+    match version {
+        8 => bincode::deserialize(raw).context("desserializando catálogo (v8 legado)"),
+        9 => rmp_serde::from_slice(raw).context("desserializando catálogo (v9)"),
+        v => bail!("versão de formato {v} não suportada"),
     }
 }
 
@@ -1751,7 +1777,7 @@ mod tests {
         assert_eq!(s.unique_blocks, 1, "dedup deveria colapsar blocos iguais");
 
         drop(v); // libera a trava antes de reabrir o mesmo cofre
-        let mut v2 = Vault::open(&vault_path, None).unwrap();
+        let v2 = Vault::open(&vault_path, None).unwrap();
         let mut out = Cursor::new(Vec::new());
         v2.extract("a.bin", &mut out).unwrap();
         assert_eq!(out.into_inner(), b"conteudo identico repetido");
@@ -1807,7 +1833,7 @@ mod tests {
         assert!(report.reclaimed_bytes() > 30_000, "deveria recuperar o arquivo grande");
 
         // O container compactado ainda abre e o arquivo mantido bate.
-        let mut v2 = Vault::open(&compact_path, None).unwrap();
+        let v2 = Vault::open(&compact_path, None).unwrap();
         let mut out = Cursor::new(Vec::new());
         v2.extract("/docs/keep.bin", &mut out).unwrap();
         assert_eq!(out.into_inner(), std::fs::read(&keep).unwrap());
@@ -1851,12 +1877,104 @@ mod tests {
             file.seek(SeekFrom::Start(5000)).unwrap();
             file.write_all(&[0xFF; 128]).unwrap();
         }
-        let mut v2 = Vault::open(&vp, None).unwrap();
+        let v2 = Vault::open(&vp, None).unwrap();
         let rep2 = v2.verify().unwrap();
         assert!(!rep2.is_healthy());
         assert!(rep2.blocks_bad > 0);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opens_and_migrates_a_v8_vault() {
+        let dir = tmp_dir("migrate");
+        let vp = dir.join("old.vault");
+        let _ = std::fs::remove_file(&vp);
+
+        // Fabrica um cofre v8 (legado): header v8 + catálogo em bincode, sem cifra.
+        let mut cat = Catalog::default();
+        cat.files.insert(
+            "/legado.txt".into(),
+            FileEntry { size: 0, mtime: 7, chunks: vec![] },
+        );
+        cat.dirs.insert("/pasta".into());
+        let raw = bincode::serialize(&cat).unwrap();
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::File::create(&vp).unwrap();
+            f.set_len(HEADER_SIZE).unwrap();
+            f.seek(SeekFrom::Start(HEADER_SIZE)).unwrap();
+            f.write_all(&raw).unwrap();
+            let mut header = [0u8; HEADER_SIZE as usize];
+            header[0..8].copy_from_slice(MAGIC);
+            header[8..12].copy_from_slice(&8u32.to_le_bytes()); // versão 8
+            header[12..16].copy_from_slice(&DEFAULT_AVG_CHUNK.to_le_bytes());
+            header[16..24].copy_from_slice(&HEADER_SIZE.to_le_bytes());
+            header[24..32].copy_from_slice(&(raw.len() as u64).to_le_bytes());
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&header).unwrap();
+        }
+
+        // Abre (lê via bincode) e confirma os dados do cofre legado.
+        let mut v = Vault::open(&vp, None).unwrap();
+        assert!(v.resolve("/legado.txt").is_some());
+        assert!(v.catalog().dirs.contains("/pasta"));
+        v.commit().unwrap(); // reescreve no formato ATUAL (v9)
+        drop(v);
+
+        // Reabre: agora é v9 no disco, dados intactos.
+        let v2 = Vault::open(&vp, None).unwrap();
+        assert!(v2.resolve("/legado.txt").is_some());
+        drop(v2);
+        let disk = std::fs::read(&vp).unwrap();
+        let ver = u32::from_le_bytes(disk[8..12].try_into().unwrap());
+        assert_eq!(ver, FORMAT_VERSION, "deveria ter migrado para o formato atual");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v9_format_tolerates_added_and_removed_fields() {
+        // Catálogo gravado por uma versão ANTIGA (sem o campo `quota`).
+        #[derive(serde::Serialize)]
+        struct OldCatalog {
+            blocks: HashMap<Hash, BlockRef>,
+            files: BTreeMap<String, FileEntry>,
+            snapshots: Vec<Snapshot>,
+            dirs: BTreeSet<String>,
+        }
+        let old = OldCatalog {
+            blocks: HashMap::new(),
+            files: BTreeMap::new(),
+            snapshots: vec![],
+            dirs: BTreeSet::new(),
+        };
+        let bytes = rmp_serde::to_vec_named(&old).unwrap();
+        // A versão ATUAL lê sem erro; o campo ausente vira default (None).
+        let cat: Catalog = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(cat.quota, None);
+
+        // Catálogo de uma versão FUTURA (campo extra desconhecido) é lido, ignorando-o.
+        #[derive(serde::Serialize)]
+        struct NewerCatalog {
+            blocks: HashMap<Hash, BlockRef>,
+            files: BTreeMap<String, FileEntry>,
+            snapshots: Vec<Snapshot>,
+            dirs: BTreeSet<String>,
+            quota: Option<u64>,
+            campo_do_futuro: u64,
+        }
+        let newer = NewerCatalog {
+            blocks: HashMap::new(),
+            files: BTreeMap::new(),
+            snapshots: vec![],
+            dirs: BTreeSet::new(),
+            quota: Some(42),
+            campo_do_futuro: 999,
+        };
+        let bytes2 = rmp_serde::to_vec_named(&newer).unwrap();
+        let cat2: Catalog = rmp_serde::from_slice(&bytes2).unwrap();
+        assert_eq!(cat2.quota, Some(42));
     }
 
     #[test]
@@ -1985,7 +2103,7 @@ mod tests {
         // Rekey: REMOVER senha.
         let rk2 = dir.join("m3.vault");
         v2.rekey_to(&rk2, None).unwrap();
-        let mut v3 = Vault::open(&rk2, None).unwrap();
+        let v3 = Vault::open(&rk2, None).unwrap();
         assert!(!v3.is_encrypted());
         let mut out = Cursor::new(Vec::new());
         v3.extract("s.txt", &mut out).unwrap();
@@ -2235,7 +2353,7 @@ mod tests {
         drop(v); // libera a trava antes de reabrir
         let mut v2 = Vault::open(&vault_path, None).unwrap();
         v2.compact_to(&compact_path).unwrap();
-        let mut v3 = Vault::open(&compact_path, None).unwrap();
+        let v3 = Vault::open(&compact_path, None).unwrap();
         assert_eq!(v3.snapshots().len(), 1);
         let mut out = Cursor::new(Vec::new());
         v3.extract("doc.txt", &mut out).unwrap();
@@ -2287,7 +2405,7 @@ mod tests {
         assert!(Vault::open(&vault_path, None).is_err());
 
         // Senha certa decifra e o conteúdo bate.
-        let mut v2 = Vault::open(&vault_path, Some("senha-forte")).unwrap();
+        let v2 = Vault::open(&vault_path, Some("senha-forte")).unwrap();
         assert!(v2.is_encrypted());
         let mut out = Cursor::new(Vec::new());
         v2.extract("segredo.txt", &mut out).unwrap();

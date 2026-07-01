@@ -35,11 +35,14 @@ Cada bloco é identificado por `blake3(conteúdo)`. Disso decorre:
 ```
 [ HEADER (4 KiB) ]  magic, versão, chunk_size, offset+len do catálogo
 [ DADOS          ]  blocos append-only
-[ CATÁLOGO       ]  índice de blocos (dedup) + tabela de arquivos (bincode)
+[ CATÁLOGO       ]  índice de blocos (dedup) + tabela de arquivos (MessagePack)
 ```
 Durabilidade: grava catálogo → fsync → atualiza ponteiro no header → fsync.
 Cair antes do header mantém o catálogo anterior válido. Cada catálogo gravado é
 uma geração — semente do versionamento.
+Formato do catálogo (v9+): MessagePack com structs por NOME de campo — adicionar
+um campo (`#[serde(default)]`) ou remover um NÃO quebra cofres existentes. Cofres
+v8 (bincode legado) são lidos e MIGRADOS para v9 no primeiro commit.
 
 ## Estado atual
 - [x] Workspace Rust: `fsm-core` (motor) + `fsm-cli` (binário `fsm`).
@@ -101,6 +104,14 @@ uma geração — semente do versionamento.
       → a UI atualiza e mostra "💾 salvo no cofre". Watches são limpos ao trocar/
       fechar/montar o cofre. Temp em subárvore lógica evita colisão de nomes iguais.
       Botão "👁️ Parar de observar (N)" na toolbar (`watch_count`/`stop_watching`).
+- [x] FORMATO TOLERANTE + MIGRAÇÃO (longevidade): catálogo passou de `bincode`
+      (posicional, quebrava a cada mudança de campo) para MessagePack com structs
+      por NOME (`rmp_serde::to_vec_named`). `FORMAT_VERSION=9`, `MIN=8`. `open`
+      aceita a faixa 8..=9 e desserializa conforme a versão do header; cofres v8
+      são migrados para v9 no 1º commit (transparente). Dali pra frente, adicionar/
+      remover campo não força bump nem recria vault. VALIDADO: teste de migração
+      real v8→v9 (fabrica header+bincode, abre, migra, confirma v9 no disco) e
+      teste de tolerância (campo ausente vira default; campo extra é ignorado).
 - [x] TRAVA DE VAULT (integridade): ao abrir/criar um `.vault`, o `fsm-core`
       adquire uma TRAVA EXCLUSIVA do SO no próprio arquivo (`fs2::try_lock_exclusive`),
       liberada automaticamente ao fechar (drop do `Vault`) — inclusive se o processo
