@@ -25,6 +25,11 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "RiseTec",
+    "category": "Utility",
+    "licenseFile": "../../../LICENSE",
+    "shortDescription": "Gerenciador de container virtual (cofre .vault)",
+    "longDescription": "fsmanager — guarda todos os seus arquivos dentro de um único container virtual, com criptografia, deduplicação, compressão, snapshots e montagem como drive.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

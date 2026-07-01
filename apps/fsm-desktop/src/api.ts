@@ -104,6 +104,8 @@ export const api = {
   mountDrive: (mountpoint: string) => invoke<string>("mount_drive", { mountpoint }),
   unmountDrive: () => invoke<void>("unmount_drive"),
   mountStatus: () => invoke<string | null>("mount_status"),
+  mountPrereqOk: () => invoke<boolean>("mount_prereq_ok"),
+  openUrl: (url: string) => invoke<void>("open_url", { url }),
 };
 
 export function onAddProgress(cb: (p: AddProgress) => void): Promise<UnlistenFn> {

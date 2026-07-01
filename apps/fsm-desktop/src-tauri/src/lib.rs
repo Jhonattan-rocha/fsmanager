@@ -820,11 +820,15 @@ fn resolve_mount_bin() -> Result<std::path::PathBuf, String> {
     }
     if let Ok(exe) = std::env::current_exe() {
         let dir = exe.parent();
-        // 1) ao lado do exe (caso de produção: empacotados juntos).
+        // 1) ao lado do exe ou em resources/ (caso de produção: empacotados juntos).
         if let Some(d) = dir {
             let sibling = d.join(name);
             if sibling.exists() {
                 return Ok(sibling);
+            }
+            let in_resources = d.join("resources").join(name);
+            if in_resources.exists() {
+                return Ok(in_resources);
             }
         }
         // 2) dev: sobe pelos ancestrais procurando crates/fsm-mount/target/{debug,release}.
@@ -1043,6 +1047,43 @@ fn unmount_drive(state: State<AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Verifica se o pré-requisito de montagem está presente: WinFsp no Windows,
+/// FUSE (fusermount) no Linux. A UI avisa o usuário antes de tentar montar.
+#[cfg(windows)]
+fn mount_prereq_present() -> bool {
+    // 1) Chave de registro do WinFsp.
+    if let Ok(o) = std::process::Command::new("reg")
+        .args(["query", r"HKLM\SOFTWARE\WOW6432Node\WinFsp"])
+        .output()
+    {
+        if o.status.success() {
+            return true;
+        }
+    }
+    // 2) Diretório de instalação padrão.
+    Path::new(r"C:\Program Files (x86)\WinFsp\bin").exists()
+        || Path::new(r"C:\Program Files\WinFsp\bin").exists()
+}
+#[cfg(unix)]
+fn mount_prereq_present() -> bool {
+    ["/bin/fusermount3", "/usr/bin/fusermount3", "/bin/fusermount", "/usr/bin/fusermount"]
+        .iter()
+        .any(|p| Path::new(p).exists())
+}
+
+/// `true` se dá para montar como drive nesta máquina (WinFsp/FUSE presente).
+#[tauri::command]
+fn mount_prereq_ok() -> bool {
+    mount_prereq_present()
+}
+
+/// Abre uma URL no navegador padrão (ex.: página de download do WinFsp).
+#[tauri::command(async)]
+fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener().open_url(url, None::<&str>).map_err(s)
+}
+
 /// Ponto de montagem atual, se houver drive montado.
 #[tauri::command]
 fn mount_status(state: State<AppState>) -> Option<String> {
@@ -1144,6 +1185,8 @@ pub fn run() {
             mount_drive,
             unmount_drive,
             mount_status,
+            mount_prereq_ok,
+            open_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

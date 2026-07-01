@@ -366,6 +366,15 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
   const doMount = () =>
     guarded(async () => {
       const isWin = navigator.userAgent.includes("Windows");
+      // Pré-requisito do mount: WinFsp (Windows) / FUSE (Linux).
+      if (!(await api.mountPrereqOk())) {
+        const what = isWin ? "O WinFsp" : "O FUSE (fusermount)";
+        const url = isWin ? "https://winfsp.dev/rel/" : "https://github.com/libfuse/libfuse";
+        if (confirm(`${what} não está instalado — necessário para montar como drive.\n\nAbrir a página de download?`)) {
+          await api.openUrl(url);
+        }
+        return;
+      }
       const def = isWin ? "X:" : "/mnt/fsm";
       const hint = isWin ? "Letra de drive (ex: X:)" : "Diretório de montagem (ex: /mnt/fsm — deve existir)";
       const mp = prompt(hint, def);
