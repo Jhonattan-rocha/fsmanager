@@ -112,6 +112,13 @@ v8 (bincode legado) são lidos e MIGRADOS para v9 no primeiro commit.
       remover campo não força bump nem recria vault. VALIDADO: teste de migração
       real v8→v9 (fabrica header+bincode, abre, migra, confirma v9 no disco) e
       teste de tolerância (campo ausente vira default; campo extra é ignorado).
+- [x] ZEROIZAÇÃO DE SEGREDOS (segurança): a CHAVE-MESTRA (`EncState.key`) é zerada
+      da memória ao fechar o cofre — `#[derive(ZeroizeOnDrop)]` no `EncState` (salt/
+      verify são pulados: não são segredos). No backend, a senha da sessão
+      (`OpenVault.password`) virou `Zeroizing<String>` — zera no drop, inclusive nos
+      clones (mount/gc/rekey). Reduz a exposição da chave/senha em dumps de memória
+      ou swap. As cifras (chacha20poly1305) já zeram suas cópias de chave por conta
+      própria. Encriptação validada intacta (round-trip cifrado + testes do core).
 - [x] TRAVA DE VAULT (integridade): ao abrir/criar um `.vault`, o `fsm-core`
       adquire uma TRAVA EXCLUSIVA do SO no próprio arquivo (`fs2::try_lock_exclusive`),
       liberada automaticamente ao fechar (drop do `Vault`) — inclusive se o processo

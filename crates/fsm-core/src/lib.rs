@@ -39,6 +39,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use chacha20poly1305::{aead::Aead, Key, KeyInit, XChaCha20Poly1305, XNonce};
 use fastcdc::v2020::StreamCDC;
 use fs2::FileExt;
+use zeroize::ZeroizeOnDrop;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
@@ -173,10 +174,16 @@ pub struct Catalog {
 }
 
 /// Estado de criptografia de um container aberto (presente só se tem senha).
+/// A CHAVE-MESTRA é zerada da memória quando o vault é fechado (drop), reduzindo
+/// a exposição em dumps de memória/swap. `salt` e `verify` não são segredos
+/// (vivem em claro no header), então são pulados.
+#[derive(ZeroizeOnDrop)]
 struct EncState {
     key: [u8; KEY_LEN],
+    #[zeroize(skip)]
     salt: [u8; SALT_LEN],
     /// Token de verificação selado (nonce || ciphertext), preservado no header.
+    #[zeroize(skip)]
     verify: Vec<u8>,
 }
 

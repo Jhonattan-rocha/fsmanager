@@ -18,3 +18,4 @@ rand.workspace = true
 fastcdc.workspace = true
 fs2 = "0.4"
 rmp-serde = "1"
+zeroize = { version = "1", features = ["derive"] }

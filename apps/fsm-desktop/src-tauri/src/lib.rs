@@ -13,13 +13,16 @@ use std::time::{Duration, Instant, SystemTime};
 
 use fsm_core::{NodeKind, Vault, DEFAULT_AVG_CHUNK};
 use serde::Serialize;
+use zeroize::Zeroizing;
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 /// Vault aberto + contexto necessário para reabrir após `gc`.
+/// A senha fica em `Zeroizing<String>`: é zerada da memória quando descartada
+/// (fechar o cofre, trocar de vault, gc/rekey) — inclusive nos clones.
 struct OpenVault {
     path: String,
-    password: Option<String>,
+    password: Option<Zeroizing<String>>,
     vault: Vault,
 }
 
@@ -314,7 +317,11 @@ fn create_vault(
     .map_err(s)?;
     let info = build_info(&path, &vault);
     state.watches.lock().unwrap().clear();
-    *state.open.lock().unwrap() = Some(OpenVault { path, password: pw, vault });
+    *state.open.lock().unwrap() = Some(OpenVault {
+        path,
+        password: pw.map(Zeroizing::new),
+        vault,
+    });
     Ok(info)
 }
 
@@ -337,7 +344,11 @@ fn open_vault(
     let vault = Vault::open(&path, pw.as_deref()).map_err(s)?;
     let info = build_info(&path, &vault);
     state.watches.lock().unwrap().clear();
-    *state.open.lock().unwrap() = Some(OpenVault { path, password: pw, vault });
+    *state.open.lock().unwrap() = Some(OpenVault {
+        path,
+        password: pw.map(Zeroizing::new),
+        vault,
+    });
     Ok(info)
 }
 
@@ -695,13 +706,13 @@ fn gc_vault(state: State<AppState>) -> Result<(), String> {
 
     if let Err(e) = result {
         // Restaura o estado anterior em caso de falha.
-        let reopened = Vault::open(&path, password.as_deref()).map_err(s)?;
+        let reopened = Vault::open(&path, password.as_ref().map(|z| z.as_str())).map_err(s)?;
         *guard = Some(OpenVault { path, password, vault: reopened });
         return Err(s(e));
     }
 
     std::fs::rename(&tmp, &path).map_err(s)?;
-    let vault = Vault::open(&path, password.as_deref()).map_err(s)?;
+    let vault = Vault::open(&path, password.as_ref().map(|z| z.as_str())).map_err(s)?;
     *guard = Some(OpenVault { path, password, vault });
     Ok(())
 }
@@ -735,7 +746,7 @@ fn change_password(
     drop(vault); // fecha o handle do original antes de substituir
 
     if let Err(e) = result {
-        let reopened = Vault::open(&path, password.as_deref()).map_err(s)?;
+        let reopened = Vault::open(&path, password.as_ref().map(|z| z.as_str())).map_err(s)?;
         *guard = Some(OpenVault { path, password, vault: reopened });
         return Err(s(e));
     }
@@ -743,7 +754,7 @@ fn change_password(
     let vault = Vault::open(&path, new_pw.as_deref()).map_err(s)?;
     *guard = Some(OpenVault {
         path,
-        password: new_pw,
+        password: new_pw.map(Zeroizing::new),
         vault,
     });
     Ok(())
@@ -894,8 +905,8 @@ fn read_child_stderr(child: &mut std::process::Child) -> String {
 }
 
 /// Reabre o vault (usado para restaurar o estado se a montagem falhar).
-fn reopen_vault(state: &AppState, path: &str, password: &Option<String>) {
-    if let Ok(v) = Vault::open(path, password.as_deref()) {
+fn reopen_vault(state: &AppState, path: &str, password: &Option<Zeroizing<String>>) {
+    if let Ok(v) = Vault::open(path, password.as_ref().map(|z| z.as_str())) {
         *state.open.lock().unwrap() = Some(OpenVault {
             path: path.to_string(),
             password: password.clone(),
