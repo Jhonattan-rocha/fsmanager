@@ -194,6 +194,60 @@ fn collect_pairs(src: &Path, dest_dir: &str, out: &mut Vec<(String, String)>) {
     }
 }
 
+/// Decodifica percent-encoding (%20 etc.) — para caminhos vindos como URI.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(h) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(h);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Normaliza um caminho vindo do drag-drop do SO. Alguns ambientes entregam
+/// URIs `file://` em vez de caminhos nativos — nesse caso o `is_dir()` falha
+/// e nada é copiado. Aqui convertemos de volta para um caminho do disco.
+fn normalize_drop_path(p: &str) -> String {
+    let p = p.trim();
+    if let Some(rest) = p.strip_prefix("file://") {
+        // Windows: file:///C:/x -> C:/x (tira a barra extra); Unix: file:///x -> /x
+        let rest = if cfg!(windows) {
+            rest.strip_prefix('/').unwrap_or(rest)
+        } else {
+            rest
+        };
+        return percent_decode(rest);
+    }
+    p.to_string()
+}
+
+/// Registra os caminhos recebidos de um drop (diagnóstico) em
+/// `temp/fsmanager-drop.log`.
+fn log_drop(paths: &[String]) {
+    use std::io::Write;
+    let logf = std::env::temp_dir().join("fsmanager-drop.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(logf) {
+        for p in paths {
+            let pt = Path::new(p);
+            let _ = writeln!(
+                file,
+                "drop path={p:?} is_file={} is_dir={}",
+                pt.is_file(),
+                pt.is_dir()
+            );
+        }
+    }
+}
+
 fn add_sources(
     app: &tauri::AppHandle,
     ov: &mut OpenVault,
@@ -409,9 +463,30 @@ fn add_dropped(
     if paths.is_empty() {
         return Ok(0);
     }
+    // Normaliza (trata URIs file://) e registra para diagnóstico.
+    let paths: Vec<String> = paths.iter().map(|p| normalize_drop_path(p)).collect();
+    log_drop(&paths);
+    let unreadable: Vec<String> = paths
+        .iter()
+        .filter(|p| {
+            let pt = Path::new(p.as_str());
+            !pt.is_file() && !pt.is_dir()
+        })
+        .cloned()
+        .collect();
+
     let mut guard = state.open.lock().unwrap();
     let ov = guard.as_mut().ok_or("nenhum container aberto")?;
-    add_sources(&app, ov, &paths, &dest_dir)
+    let n = add_sources(&app, ov, &paths, &dest_dir)?;
+
+    // Se nada entrou e havia caminhos ilegíveis, reporta (não fica silencioso).
+    if n == 0 && !unreadable.is_empty() {
+        return Err(format!(
+            "não consegui ler o(s) caminho(s) solto(s): {}",
+            unreadable.join(" | ")
+        ));
+    }
+    Ok(n)
 }
 
 #[tauri::command(async)]
@@ -870,10 +945,12 @@ fn mount_drive(state: State<AppState>, mountpoint: String) -> Result<String, Str
 
     let mut cmd = std::process::Command::new(&bin);
     cmd.arg(&vault_path).arg(&mountpoint);
-    if let Some(pw) = &password {
-        cmd.arg("--password").arg(pw);
+    // A senha NUNCA vai pelo argv (seria visível na lista de processos): vai pela
+    // 1ª linha do stdin. `--password-stdin` faz o fsm-mount lê-la de lá.
+    if password.is_some() {
+        cmd.arg("--password-stdin");
     }
-    // stdin em pipe (desmonte gracioso); stderr em pipe (motivo de falha).
+    // stdin em pipe (senha + desmonte gracioso); stderr em pipe (motivo de falha).
     cmd.stdin(Stdio::piped()).stderr(Stdio::piped());
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -882,6 +959,15 @@ fn mount_drive(state: State<AppState>, mountpoint: String) -> Result<String, Str
             return Err(format!("falha ao iniciar {}: {e}", bin.display()));
         }
     };
+    // Entrega a senha pela 1ª linha do stdin (mantém o pipe aberto p/ o desmonte).
+    if let Some(pw) = &password {
+        if let Some(stdin) = child.stdin.as_mut() {
+            use std::io::Write;
+            let _ = stdin.write_all(pw.as_bytes());
+            let _ = stdin.write_all(b"\n");
+            let _ = stdin.flush();
+        }
+    }
 
     // Confirma que subiu. A falha confiável é o processo SAIR (mount/dispatcher
     // deu erro); nunca matamos um mount vivo por timeout.
@@ -1050,4 +1136,46 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collect_pairs_recurses_folder() {
+        let base = std::env::temp_dir().join("fsm-cp-test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("Teste/sub")).unwrap();
+        std::fs::write(base.join("Teste/a.txt"), b"a").unwrap();
+        std::fs::write(base.join("Teste/sub/b.txt"), b"b").unwrap();
+
+        let mut out = Vec::new();
+        collect_pairs(&base.join("Teste"), "/", &mut out);
+        let logicals: Vec<&str> = out.iter().map(|(_, l)| l.as_str()).collect();
+        assert!(logicals.contains(&"/Teste/a.txt"), "faltou a.txt: {logicals:?}");
+        assert!(logicals.contains(&"/Teste/sub/b.txt"), "faltou sub/b.txt: {logicals:?}");
+        assert_eq!(out.len(), 2);
+
+        // Drop dentro de uma subpasta do cofre.
+        let mut out2 = Vec::new();
+        collect_pairs(&base.join("Teste"), "/docs", &mut out2);
+        assert!(out2.iter().any(|(_, l)| l == "/docs/Teste/a.txt"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn normalize_drop_path_handles_uri() {
+        // Caminho nativo passa intacto.
+        assert_eq!(normalize_drop_path("C:\\Users\\x\\Teste"), "C:\\Users\\x\\Teste");
+        // URI com percent-encoding vira caminho de disco.
+        #[cfg(windows)]
+        assert_eq!(
+            normalize_drop_path("file:///C:/Users/x/Nova%20Pasta"),
+            "C:/Users/x/Nova Pasta"
+        );
+        #[cfg(unix)]
+        assert_eq!(normalize_drop_path("file:///home/x/a%20b"), "/home/x/a b");
+    }
 }

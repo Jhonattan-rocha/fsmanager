@@ -38,6 +38,7 @@ use std::time::UNIX_EPOCH;
 use anyhow::{anyhow, bail, Context, Result};
 use chacha20poly1305::{aead::Aead, Key, KeyInit, XChaCha20Poly1305, XNonce};
 use fastcdc::v2020::StreamCDC;
+use fs2::FileExt;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
@@ -300,6 +301,10 @@ impl Vault {
             .create_new(true)
             .open(&path)
             .with_context(|| format!("criando {}", path.display()))?;
+        // Trava exclusiva (liberada no drop): impede dois escritores no container.
+        file.try_lock_exclusive().map_err(|_| {
+            anyhow!("o cofre já está aberto em outro processo (ou montado como drive)")
+        })?;
 
         let mut vault = Vault {
             file,
@@ -324,6 +329,10 @@ impl Vault {
             .write(true)
             .open(&path)
             .with_context(|| format!("abrindo {}", path.display()))?;
+        // Trava exclusiva (liberada no drop): impede dois processos no mesmo cofre.
+        file.try_lock_exclusive().map_err(|_| {
+            anyhow!("o cofre já está aberto em outro processo (ou montado como drive)")
+        })?;
 
         let mut header = [0u8; HEADER_SIZE as usize];
         file.seek(SeekFrom::Start(0))?;
@@ -1741,6 +1750,7 @@ mod tests {
         assert_eq!(s.files, 2);
         assert_eq!(s.unique_blocks, 1, "dedup deveria colapsar blocos iguais");
 
+        drop(v); // libera a trava antes de reabrir o mesmo cofre
         let mut v2 = Vault::open(&vault_path, None).unwrap();
         let mut out = Cursor::new(Vec::new());
         v2.extract("a.bin", &mut out).unwrap();
@@ -1846,6 +1856,22 @@ mod tests {
         assert!(!rep2.is_healthy());
         assert!(rep2.blocks_bad > 0);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn second_open_is_blocked_by_lock() {
+        let dir = tmp_dir("lock");
+        let vp = dir.join("l.vault");
+        let _ = std::fs::remove_file(&vp);
+        let v = Vault::create(&vp, 64).unwrap();
+        // Abrir o MESMO cofre uma 2ª vez deve falhar (trava exclusiva do SO).
+        assert!(
+            Vault::open(&vp, None).is_err(),
+            "abrir o cofre 2x ao mesmo tempo deveria falhar pela trava"
+        );
+        drop(v); // fechou => libera a trava
+        assert!(Vault::open(&vp, None).is_ok(), "após fechar, deveria abrir normal");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2206,6 +2232,7 @@ mod tests {
         assert_eq!(out.into_inner(), b"versao um do documento");
 
         // gc deve preservar os blocos do snapshot v1 (história intacta).
+        drop(v); // libera a trava antes de reabrir
         let mut v2 = Vault::open(&vault_path, None).unwrap();
         v2.compact_to(&compact_path).unwrap();
         let mut v3 = Vault::open(&compact_path, None).unwrap();
@@ -2265,6 +2292,7 @@ mod tests {
         let mut out = Cursor::new(Vec::new());
         v2.extract("segredo.txt", &mut out).unwrap();
         assert_eq!(out.into_inner(), payload);
+        drop(v2); // libera a trava para ler o arquivo cru abaixo
 
         // O texto-claro NÃO deve aparecer cru no arquivo do container.
         let raw = std::fs::read(&vault_path).unwrap();

@@ -77,5 +77,7 @@ fsm-mount meu.vault X:
 # Linux (precisa do FUSE):
 fsm-mount meu.vault /mnt/fsm
 ```
-Ctrl+C desmonta. Use o binário **release** — em debug a compressão/hash são
+Para cofre cifrado: `-p senha` (menos seguro — aparece na lista de processos),
+`FSM_PASSWORD=senha` (env), ou `--password-stdin` (lê a senha do stdin; é o que a
+UI usa, sem expor no argv). Ctrl+C desmonta. Use o binário **release** — em debug a compressão/hash são
 muito mais lentas.

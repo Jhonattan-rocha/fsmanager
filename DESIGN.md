@@ -101,6 +101,21 @@ uma geração — semente do versionamento.
       → a UI atualiza e mostra "💾 salvo no cofre". Watches são limpos ao trocar/
       fechar/montar o cofre. Temp em subárvore lógica evita colisão de nomes iguais.
       Botão "👁️ Parar de observar (N)" na toolbar (`watch_count`/`stop_watching`).
+- [x] TRAVA DE VAULT (integridade): ao abrir/criar um `.vault`, o `fsm-core`
+      adquire uma TRAVA EXCLUSIVA do SO no próprio arquivo (`fs2::try_lock_exclusive`),
+      liberada automaticamente ao fechar (drop do `Vault`) — inclusive se o processo
+      cair (o SO solta). Impede que dois processos (UI + `fsm add`, duas instâncias,
+      ou UI + drive montado) escrevam e corrompam o container. Erro claro: "o cofre
+      já está aberto em outro processo (ou montado como drive)". `gc`/rekey/mount
+      já faziam `drop` antes de reabrir, então encaixam. VALIDADO cross-process:
+      com o vault montado, `fsm ls` no mesmo arquivo falha; após desmontar, volta.
+- [x] SENHA FORA DO ARGV (segurança): a senha NUNCA é passada por argumento de
+      linha de comando ao `fsm-mount` (seria visível em `Win32_Process`/ps). O
+      backend passa `--password-stdin` e escreve a senha na 1ª linha do stdin
+      (`write_all` de bytes crus); o `fsm-mount` a lê byte a byte (sem over-read,
+      preservando o EOF do desmonte) e ignora BOM. `--password` (argv) e
+      `FSM_PASSWORD` (env) seguem para uso manual via CLI. VALIDADO: cofre cifrado
+      monta e lê pelo stdin, e a senha não aparece na cmdline do processo.
 - [x] MONTAGEM BLINDADA: `mount_drive` (async) valida o ponto ANTES de fechar o
       vault (Windows: formato de letra + letra livre; Unix: diretório existe),
       trava contra montagens concorrentes (`AtomicBool` + guard), confirma que o
