@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -33,6 +34,8 @@ struct WatchEntry {
 struct AppState {
     open: Mutex<Option<OpenVault>>,
     mount: Mutex<Option<MountProc>>,
+    /// Trava contra montagens concorrentes (entre checar e efetivar o mount).
+    mounting: AtomicBool,
     /// caminho-temp -> info do arquivo aberto, para o "abrir-e-regravar".
     watches: Mutex<HashMap<PathBuf, WatchEntry>>,
 }
@@ -759,13 +762,101 @@ fn resolve_mount_bin() -> Result<std::path::PathBuf, String> {
     ))
 }
 
-/// Monta o vault aberto como drive: FECHA o vault na UI (libera o arquivo) e
-/// inicia o `fsm-mount` como processo separado no ponto de montagem dado.
-#[tauri::command]
+/// Valida e normaliza o ponto de montagem ANTES de fechar o vault.
+#[cfg(windows)]
+fn validate_mountpoint(mp: &str) -> Result<String, String> {
+    let t = mp.trim().trim_end_matches(['\\', '/']);
+    let letter = t
+        .chars()
+        .next()
+        .ok_or("informe uma letra de drive (ex.: X:)")?;
+    let ok_shape =
+        letter.is_ascii_alphabetic() && (t.len() == 1 || (t.len() == 2 && t.ends_with(':')));
+    if !ok_shape {
+        return Err(format!("ponto de montagem inválido: '{mp}' — use uma letra como X:"));
+    }
+    let letter = letter.to_ascii_uppercase();
+    if Path::new(&format!("{letter}:\\")).exists() {
+        return Err(format!("a letra {letter}: já está em uso — escolha outra"));
+    }
+    Ok(format!("{letter}:"))
+}
+
+/// Valida o ponto de montagem no Unix: precisa ser um diretório existente.
+#[cfg(unix)]
+fn validate_mountpoint(mp: &str) -> Result<String, String> {
+    if !Path::new(mp).is_dir() {
+        return Err(format!(
+            "o diretório de montagem '{mp}' não existe — crie-o antes de montar"
+        ));
+    }
+    Ok(mp.to_string())
+}
+
+/// Confirmação rápida de que o mount subiu (fast-path; sucesso definitivo é
+/// "o processo não saiu com erro").
+#[cfg(windows)]
+fn mount_ready(mp: &str) -> bool {
+    mp.chars()
+        .next()
+        .map(|l| Path::new(&format!("{}:\\", l.to_ascii_uppercase())).exists())
+        .unwrap_or(false)
+}
+#[cfg(unix)]
+fn mount_ready(mp: &str) -> bool {
+    std::fs::read_to_string("/proc/mounts")
+        .map(|s| s.lines().any(|l| l.split(' ').nth(1) == Some(mp)))
+        .unwrap_or(false)
+}
+
+fn read_child_stderr(child: &mut std::process::Child) -> String {
+    use std::io::Read;
+    let mut buf = String::new();
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut buf);
+    }
+    buf.trim().to_string()
+}
+
+/// Reabre o vault (usado para restaurar o estado se a montagem falhar).
+fn reopen_vault(state: &AppState, path: &str, password: &Option<String>) {
+    if let Ok(v) = Vault::open(path, password.as_deref()) {
+        *state.open.lock().unwrap() = Some(OpenVault {
+            path: path.to_string(),
+            password: password.clone(),
+            vault: v,
+        });
+    }
+}
+
+/// Garante que a flag `mounting` volte a `false` em qualquer caminho de saída.
+struct MountingGuard<'a>(&'a AtomicBool);
+impl Drop for MountingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Monta o vault aberto como drive, de forma BLINDADA: valida o ponto antes de
+/// fechar o vault, confirma que o processo subiu (senão reabre o vault e reporta
+/// o motivo), e trava contra montagens concorrentes.
+#[tauri::command(async)]
 fn mount_drive(state: State<AppState>, mountpoint: String) -> Result<String, String> {
+    // Trava: só uma montagem por vez (reset garantido pelo guard).
+    if state
+        .mounting
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("já há uma montagem em andamento".into());
+    }
+    let _mg = MountingGuard(&state.mounting);
+
     if state.mount.lock().unwrap().is_some() {
         return Err("já existe um drive montado".into());
     }
+    // Valida/normaliza o ponto ANTES de fechar o vault (não deixa o usuário no limbo).
+    let mountpoint = validate_mountpoint(&mountpoint)?;
     let (vault_path, password) = {
         let guard = state.open.lock().unwrap();
         let ov = guard.as_ref().ok_or("nenhum container aberto")?;
@@ -773,7 +864,7 @@ fn mount_drive(state: State<AppState>, mountpoint: String) -> Result<String, Str
     };
     let bin = resolve_mount_bin()?;
 
-    // Fecha o vault na UI ANTES de montar (evita dois escritores no mesmo arquivo).
+    // Fecha o vault ANTES de montar (evita dois escritores no mesmo arquivo).
     state.watches.lock().unwrap().clear();
     *state.open.lock().unwrap() = None;
 
@@ -782,11 +873,44 @@ fn mount_drive(state: State<AppState>, mountpoint: String) -> Result<String, Str
     if let Some(pw) = &password {
         cmd.arg("--password").arg(pw);
     }
-    // stdin em pipe: fechá-lo depois sinaliza o desmonte gracioso (libera a letra).
-    cmd.stdin(Stdio::piped());
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("falha ao iniciar {}: {e}", bin.display()))?;
+    // stdin em pipe (desmonte gracioso); stderr em pipe (motivo de falha).
+    cmd.stdin(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            reopen_vault(&state, &vault_path, &password);
+            return Err(format!("falha ao iniciar {}: {e}", bin.display()));
+        }
+    };
+
+    // Confirma que subiu. A falha confiável é o processo SAIR (mount/dispatcher
+    // deu erro); nunca matamos um mount vivo por timeout.
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        std::thread::sleep(Duration::from_millis(120));
+        if let Ok(Some(_)) = child.try_wait() {
+            let why = read_child_stderr(&mut child);
+            let _ = child.wait();
+            reopen_vault(&state, &vault_path, &password);
+            let msg = if why.is_empty() {
+                "o processo de montagem encerrou inesperadamente (o WinFsp está instalado?)"
+                    .to_string()
+            } else {
+                why
+            };
+            return Err(format!("falha ao montar em {mountpoint}: {msg}"));
+        }
+        if mount_ready(&mountpoint) || Instant::now() >= deadline {
+            break; // confirmado, ou vivo após o timeout => assume montado
+        }
+    }
+
+    // Sucesso: drena o stderr (evita bloqueio por pipe cheio) e guarda o processo.
+    if let Some(mut err) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut err, &mut std::io::sink());
+        });
+    }
     *state.mount.lock().unwrap() = Some(MountProc {
         child,
         mountpoint: mountpoint.clone(),

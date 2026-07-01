@@ -101,6 +101,13 @@ uma geração — semente do versionamento.
       → a UI atualiza e mostra "💾 salvo no cofre". Watches são limpos ao trocar/
       fechar/montar o cofre. Temp em subárvore lógica evita colisão de nomes iguais.
       Botão "👁️ Parar de observar (N)" na toolbar (`watch_count`/`stop_watching`).
+- [x] MONTAGEM BLINDADA: `mount_drive` (async) valida o ponto ANTES de fechar o
+      vault (Windows: formato de letra + letra livre; Unix: diretório existe),
+      trava contra montagens concorrentes (`AtomicBool` + guard), confirma que o
+      processo subiu (a falha confiável é o `fsm-mount` SAIR — testado: sai com
+      exit 1 + motivo no stderr) e, se falhar, REABRE o vault (`reopen_vault`) e
+      reporta o motivo capturado do stderr. Nunca mata um mount vivo por timeout;
+      no sucesso, drena o stderr numa thread (evita bloqueio por pipe cheio).
 - [x] DESMONTE GRACIOSO (corrige letra "fantasma"): matar o `fsm-mount` à força
       (TerminateProcess) deixava a letra presa porque o WinFsp não desmontava.
       Agora o processo é iniciado com stdin em pipe e o `fsm-mount` desmonta ao

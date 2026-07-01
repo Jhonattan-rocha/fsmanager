@@ -370,6 +370,7 @@ export default function Workspace({ initialInfo, onClosed, onMounted }: Props) {
       const hint = isWin ? "Letra de drive (ex: X:)" : "Diretório de montagem (ex: /mnt/fsm — deve existir)";
       const mp = prompt(hint, def);
       if (!mp) return;
+      toast("⏳ Montando… fechando o cofre e subindo o drive", { sticky: true });
       const at = await api.mountDrive(mp);
       onMounted(at);
       toast(`montado em ${at}`);
