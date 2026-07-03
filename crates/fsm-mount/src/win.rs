@@ -339,11 +339,21 @@ impl FileSystemContext for FsmFs {
     }
 
     fn get_volume_info(&self, out: &mut VolumeInfo) -> winfsp::Result<()> {
-        // Adaptativo: livre = espaço real do host; total = usado + livre.
-        let used = self.vault.read().unwrap().stats().logical_bytes;
-        let free = host_free_bytes(&self.vault_dir);
-        out.total_size = used + free;
-        out.free_size = free;
+        let v = self.vault.read().unwrap();
+        let used = v.used_bytes();
+        match v.quota() {
+            // Com cota: o drive reflete o LIMITE do cofre (não o disco host).
+            Some(quota) => {
+                out.total_size = quota;
+                out.free_size = quota.saturating_sub(used);
+            }
+            // Sem cota: adaptativo — o cofre pode crescer até o espaço real do host.
+            None => {
+                let free = host_free_bytes(&self.vault_dir);
+                out.total_size = used + free;
+                out.free_size = free;
+            }
+        }
         out.set_volume_label(&self.label);
         Ok(())
     }

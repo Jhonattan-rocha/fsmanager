@@ -44,8 +44,23 @@ para o `fsm-mount`, por causa do `winfsp-sys`). Requer **WinFsp instalado**.
 Requer `libfuse3-dev` + `pkg-config` (para o `fsm-mount`) e as dependências do
 Tauri (webkit2gtk, etc.).
 
-### Resultado
-Ambos os scripts montam a pasta `dist/` com os exes **lado a lado**:
+### Instalador Windows (MSI + NSIS)
+Para gerar instaladores que o usuário final roda com duplo-clique:
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1
+```
+Isso builda os 3 binários, empacota o `fsm-mount.exe` e o `fsm.exe` **junto** do
+`fsm-desktop.exe`, e gera:
+```
+apps\fsm-desktop\src-tauri\target\release\bundle\msi\fsm-desktop_0.1.0_x64_en-US.msi
+apps\fsm-desktop\src-tauri\target\release\bundle\nsis\fsm-desktop_0.1.0_x64-setup.exe
+```
+O **WinFsp NÃO** é incluído (não distribuímos driver de terceiros): o app detecta
+e, se faltar, oferece o download em winfsp.dev antes de montar. Sem certificado de
+*code signing*, o Windows mostra aviso do SmartScreen na instalação (normal).
+
+### Resultado (portátil, sem instalador)
+Ambos os scripts de `build-release` montam a pasta `dist/` com os exes **lado a lado**:
 ```
 dist/
   fsm-desktop(.exe)

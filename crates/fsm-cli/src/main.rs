@@ -116,6 +116,17 @@ enum Cmd {
         #[arg(long, short = 'p')]
         password: Option<String>,
     },
+    /// Define, remove ou mostra a cota de tamanho do cofre (em MB).
+    Quota {
+        vault: PathBuf,
+        /// Novo limite em MB (omita para apenas mostrar a cota atual).
+        mb: Option<u64>,
+        /// Remove a cota (sem limite).
+        #[arg(long)]
+        clear: bool,
+        #[arg(long, short = 'p')]
+        password: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -361,6 +372,25 @@ fn main() -> Result<()> {
                     println!("  removido: {p}");
                 }
                 println!("\nrode 'gc' para liberar o espaço dos blocos descartados.");
+            }
+        }
+        Cmd::Quota { vault, mb, clear, password } => {
+            let pw = resolve_pw(password);
+            let mut v = Vault::open(&vault, pw.as_deref())?;
+            let used_mb = v.used_bytes() / (1024 * 1024);
+            if clear {
+                v.set_quota(None);
+                v.commit()?;
+                println!("cota removida (sem limite). usado: {used_mb} MB");
+            } else if let Some(mb) = mb {
+                v.set_quota(Some(mb.saturating_mul(1024 * 1024)));
+                v.commit()?;
+                println!("cota definida: {mb} MB. usado: {used_mb} MB");
+            } else {
+                match v.quota() {
+                    Some(b) => println!("cota: {} MB (usado: {used_mb} MB)", b / (1024 * 1024)),
+                    None => println!("cota: sem limite (usado: {used_mb} MB)"),
+                }
             }
         }
     }

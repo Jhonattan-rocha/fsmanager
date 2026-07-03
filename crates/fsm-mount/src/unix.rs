@@ -17,7 +17,8 @@ use fsm_core::{NodeKind, StreamWriter, Vault};
 use fuser::{
     BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
     INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    WriteFlags,
 };
 
 const TTL: Duration = Duration::from_secs(1);
@@ -282,6 +283,32 @@ impl Filesystem for FsmFuse {
             },
             None => reply.error(Errno::ENOENT),
         }
+    }
+
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        let inner = self.inner.lock().unwrap();
+        let used = inner.vault.used_bytes();
+        let bsize: u64 = 4096;
+        let (total, free) = match inner.vault.quota() {
+            // Com cota: o `df` reflete o LIMITE do cofre.
+            Some(q) => (q, q.saturating_sub(used)),
+            // Sem cota: folga grande (o cofre cresce livremente até o disco host).
+            None => {
+                let slack = 64u64 * 1024 * 1024 * 1024;
+                (used + slack, slack)
+            }
+        };
+        let files = inner.vault.catalog().files.len() as u64;
+        reply.statfs(
+            total / bsize, // blocks
+            free / bsize,  // bfree
+            free / bsize,  // bavail
+            files,         // files
+            0,             // ffree
+            bsize as u32,  // bsize
+            255,           // namelen
+            bsize as u32,  // frsize
+        );
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {

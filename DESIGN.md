@@ -112,6 +112,19 @@ v8 (bincode legado) são lidos e MIGRADOS para v9 no primeiro commit.
       remover campo não força bump nem recria vault. VALIDADO: teste de migração
       real v8→v9 (fabrica header+bincode, abre, migra, confirma v9 no disco) e
       teste de tolerância (campo ausente vira default; campo extra é ignorado).
+- [x] DRIVE MONTADO RESPEITA A COTA: `get_volume_info` (WinFsp) e `statfs` (FUSE)
+      reportam, quando há cota, `total = cota` e `livre = cota - usado` (antes
+      mostravam o disco host inteiro, ignorando o limite). Sem cota, mantêm o modo
+      adaptativo. Usa `Vault::quota()`/`used_bytes()` (leves). CLI ganhou `fsm quota
+      <vault> [MB] [--clear]`. VALIDADO no Windows: cofre com cota de 100 MB → o
+      drive mostra 100 MB de capacidade (via `DriveInfo`/`GetDiskFreeSpaceExW`).
+- [x] INSTALADORES WINDOWS (MSI + NSIS): `scripts/build-installer.ps1` builda os 3
+      binários, faz stage de `fsm-mount.exe`/`fsm.exe` em `src-tauri/binaries/` e roda
+      `tauri build --config installer.conf.json` (overlay que injeta os binários como
+      `resources`, ao lado do exe instalado — desacoplado do config base p/ não travar
+      dev). Metadados+licença GPLv3 no bundle. WinFsp fica como pré-requisito
+      detectado (comando `mount_prereq_ok` + `open_url` para winfsp.dev). VALIDADO: os
+      dois instaladores geram e o `.wxs` confirma os 3 binários empacotados juntos.
 - [x] ZEROIZAÇÃO DE SEGREDOS (segurança): a CHAVE-MESTRA (`EncState.key`) é zerada
       da memória ao fechar o cofre — `#[derive(ZeroizeOnDrop)]` no `EncState` (salt/
       verify são pulados: não são segredos). No backend, a senha da sessão
