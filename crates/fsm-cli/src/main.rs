@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use fsm_core::{Vault, DEFAULT_AVG_CHUNK};
 
 #[derive(Parser)]
@@ -127,6 +127,15 @@ enum Cmd {
         #[arg(long, short = 'p')]
         password: Option<String>,
     },
+    /// Mede o throughput do motor (escrita/leitura/dedup) num cofre temporário.
+    Bench {
+        /// Tamanho do payload de teste em MB (padrão: 200).
+        #[arg(long, default_value_t = 200)]
+        size: usize,
+        /// Testa com o cofre CIFRADO (mede o custo do XChaCha20/Argon2).
+        #[arg(long)]
+        encrypted: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -144,6 +153,21 @@ enum SnapAction {
 /// Resolve a senha: flag explícita ou variável de ambiente FSM_PASSWORD.
 fn resolve_pw(flag: Option<String>) -> Option<String> {
     flag.or_else(|| std::env::var("FSM_PASSWORD").ok())
+}
+
+/// Gera `n` bytes pseudo-aleatórios (incompressíveis) via xorshift — rápido e
+/// sem dependência, para o payload do `bench`.
+fn gen_pseudo_random(n: usize) -> Vec<u8> {
+    let mut out = vec![0u8; n];
+    let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+    for chunk in out.chunks_mut(8) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let b = x.to_le_bytes();
+        chunk.copy_from_slice(&b[..chunk.len()]);
+    }
+    out
 }
 
 fn main() -> Result<()> {
@@ -392,6 +416,63 @@ fn main() -> Result<()> {
                     None => println!("cota: sem limite (usado: {used_mb} MB)"),
                 }
             }
+        }
+        Cmd::Bench { size, encrypted } => {
+            let bytes_total = size * 1024 * 1024;
+            let dir = std::env::temp_dir().join(format!("fsm-bench-{}", std::process::id()));
+            std::fs::create_dir_all(&dir)?;
+            let vp = dir.join("bench.vault");
+            let _ = std::fs::remove_file(&vp);
+
+            println!(
+                "payload: {size} MB pseudo-aleatório (incompressível) · cofre {}",
+                if encrypted { "CIFRADO" } else { "sem cifra" }
+            );
+            let payload = gen_pseudo_random(bytes_total);
+
+            let mut v = if encrypted {
+                Vault::create_encrypted(&vp, DEFAULT_AVG_CHUNK, "bench-pw")?
+            } else {
+                Vault::create(&vp, DEFAULT_AVG_CHUNK)?
+            };
+            let mb = size as f64;
+
+            // Escrita.
+            let t = Instant::now();
+            v.write_file("/bench.bin", &payload, 0)?;
+            v.commit()?;
+            let w = t.elapsed().as_secs_f64();
+
+            // Dedup: grava o MESMO conteúdo de novo (deve deduplicar, quase de graça).
+            let t2 = Instant::now();
+            v.write_file("/bench_copy.bin", &payload, 0)?;
+            v.commit()?;
+            let d = t2.elapsed().as_secs_f64();
+
+            // Leitura (descarta a saída).
+            let t3 = Instant::now();
+            let mut sink = std::io::sink();
+            v.extract("/bench.bin", &mut sink)?;
+            let r = t3.elapsed().as_secs_f64();
+
+            let s = v.stats();
+            drop(v);
+            let _ = std::fs::remove_dir_all(&dir);
+
+            let rate = |secs: f64| if secs > 0.0 { mb / secs } else { f64::INFINITY };
+            println!();
+            println!("escrita:          {:>7.1} MB/s  ({:.2}s)", rate(w), w);
+            println!("dedup (2ª cópia): {:>7.1} MB/s  ({:.2}s)", rate(d), d);
+            println!("leitura:          {:>7.1} MB/s  ({:.2}s)", rate(r), r);
+            println!();
+            println!(
+                "físico no disco:  {:.1} MB  (para {:.0} MB lógicos × 2 cópias)",
+                s.physical_bytes as f64 / (1024.0 * 1024.0),
+                mb
+            );
+            println!("economia dedup:   {:.1}%", s.dedup_savings() * 100.0);
+            println!("economia compr.:  {:.1}%", s.compression_savings() * 100.0);
+            println!("economia total:   {:.1}%", s.total_savings() * 100.0);
         }
     }
     Ok(())

@@ -112,6 +112,11 @@ v8 (bincode legado) são lidos e MIGRADOS para v9 no primeiro commit.
       remover campo não força bump nem recria vault. VALIDADO: teste de migração
       real v8→v9 (fabrica header+bincode, abre, migra, confirma v9 no disco) e
       teste de tolerância (campo ausente vira default; campo extra é ignorado).
+- [x] `fsm bench` + `fsm quota` (CLI): `bench` mede o throughput do MOTOR (cofre
+      temporário, payload incompressível, escrita/dedup/leitura, cifrado ou não).
+      Números de referência (200 MB, release): escrita 50 MB/s (37 cifrado), leitura
+      780 MB/s (187 cifrado), dedup ~500 MB/s. Confirma que o teto do drive montado
+      (~29 MB/s) é o IPC do WinFsp, NÃO o motor. `quota` define/remove/mostra a cota.
 - [x] DRIVE MONTADO RESPEITA A COTA: `get_volume_info` (WinFsp) e `statfs` (FUSE)
       reportam, quando há cota, `total = cota` e `livre = cota - usado` (antes
       mostravam o disco host inteiro, ignorando o limite). Sem cota, mantêm o modo

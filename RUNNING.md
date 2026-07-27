@@ -81,6 +81,8 @@ fsm stats meu.vault
 fsm gc meu.vault                   # compacta
 fsm verify meu.vault               # checa integridade (exit≠0 se corrompido)
 fsm repair meu.vault               # repara: trunca/remove arquivos danificados
+fsm quota meu.vault 2048           # limita o cofre a 2 GB (ou --clear p/ remover)
+fsm bench --size 200               # mede throughput do motor (--encrypted opcional)
 ```
 
 ## Montar como drive (CLI)
