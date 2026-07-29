@@ -176,6 +176,10 @@ pub struct Catalog {
     /// Cota máxima de tamanho do `.vault` em bytes (None = sem limite).
     #[serde(default)]
     pub quota: Option<u64>,
+    /// Réplicas de espelhamento (caminhos de destino). Persistidas no cofre para
+    /// não precisar reconfigurar a cada sessão. Campo novo tolerante (v9).
+    #[serde(default)]
+    pub replicas: Vec<String>,
 }
 
 /// Estado de criptografia de um container aberto (presente só se tem senha).
@@ -441,6 +445,14 @@ impl Vault {
     }
     pub fn quota(&self) -> Option<u64> {
         self.catalog.quota
+    }
+    /// Réplicas de espelhamento configuradas (caminhos de destino).
+    pub fn replicas(&self) -> &[String] {
+        &self.catalog.replicas
+    }
+    /// Define a lista de réplicas (persiste no próximo `commit`).
+    pub fn set_replicas(&mut self, replicas: Vec<String>) {
+        self.catalog.replicas = replicas;
     }
     /// Tamanho atual ocupado no arquivo (bytes), para comparar com a cota.
     pub fn used_bytes(&self) -> u64 {
@@ -1426,6 +1438,7 @@ impl Vault {
             snapshots: self.catalog.snapshots.clone(),
             dirs: self.catalog.dirs.clone(),
             quota: self.catalog.quota,
+            replicas: self.catalog.replicas.clone(),
         };
         let raw = encode_catalog(&new_catalog)?;
         let bytes = match &self.enc {
@@ -1523,6 +1536,7 @@ impl Vault {
             snapshots: self.catalog.snapshots.clone(),
             dirs: self.catalog.dirs.clone(),
             quota: self.catalog.quota,
+            replicas: self.catalog.replicas.clone(),
         };
         let raw = encode_catalog(&new_catalog)?;
         let bytes = match &new_enc {

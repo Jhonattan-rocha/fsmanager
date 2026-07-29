@@ -805,6 +805,179 @@ fn repair_vault(state: State<AppState>) -> Result<RepairDto, String> {
     })
 }
 
+#[derive(Serialize)]
+struct BackupDto {
+    full: bool,
+    bytes_copied: u64,
+    total: u64,
+    dest: String,
+}
+
+/// Faz backup do cofre ABERTO para um arquivo escolhido (incremental por padrão).
+/// O app lê pelo próprio handle do vault, então funciona SEM fechar o cofre —
+/// diferente da CLI, que precisaria do lock.
+#[tauri::command(async)]
+fn backup_vault(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    full: bool,
+) -> Result<Option<BackupDto>, String> {
+    // Nome padrão a partir do caminho do cofre (breve acesso ao estado).
+    let default_name = {
+        let guard = state.open.lock().unwrap();
+        let ov = guard.as_ref().ok_or("nenhum container aberto")?;
+        let base = Path::new(&ov.path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "cofre".into());
+        format!("{base}-backup.vault")
+    };
+    let chosen = app
+        .dialog()
+        .file()
+        .set_file_name(&default_name)
+        .blocking_save_file();
+    let dest = match chosen {
+        Some(p) => p.to_string(),
+        None => return Ok(None), // cancelado
+    };
+    let guard = state.open.lock().unwrap();
+    let ov = guard.as_ref().ok_or("nenhum container aberto")?;
+    let r = ov.vault.backup_to(&dest, full).map_err(s)?;
+    Ok(Some(BackupDto {
+        full: r.full,
+        bytes_copied: r.bytes_copied,
+        total: r.total,
+        dest,
+    }))
+}
+
+/// Transfere arquivos do cofre aberto para OUTRO cofre (escolhido no diálogo),
+/// criando-o se não existir. `prefix` = subárvore ("/" = tudo).
+#[tauri::command(async)]
+fn transfer_to(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    prefix: String,
+    dst_password: Option<String>,
+) -> Result<Option<usize>, String> {
+    let chosen = app
+        .dialog()
+        .file()
+        .add_filter("Cofre fsmanager", &["vault"])
+        .blocking_save_file();
+    let dest = match chosen {
+        Some(p) => p.to_string(),
+        None => return Ok(None),
+    };
+    let guard = state.open.lock().unwrap();
+    let ov = guard.as_ref().ok_or("nenhum container aberto")?;
+    let dpw = empty_to_none(dst_password);
+    let mut dv = if Path::new(&dest).exists() {
+        Vault::open(&dest, dpw.as_deref()).map_err(s)?
+    } else if let Some(pw) = &dpw {
+        Vault::create_encrypted(&dest, DEFAULT_AVG_CHUNK, pw).map_err(s)?
+    } else {
+        Vault::create(&dest, DEFAULT_AVG_CHUNK).map_err(s)?
+    };
+    let n = dv.transfer_from(&ov.vault, &prefix).map_err(s)?;
+    dv.commit().map_err(s)?;
+    Ok(Some(n))
+}
+
+/// Réplicas configuradas no cofre.
+#[tauri::command]
+fn get_replicas(state: State<AppState>) -> Result<Vec<String>, String> {
+    let guard = state.open.lock().unwrap();
+    let ov = guard.as_ref().ok_or("nenhum container aberto")?;
+    Ok(ov.vault.replicas().to_vec())
+}
+
+/// Adiciona uma réplica (escolhida no diálogo) e persiste no cofre.
+#[tauri::command(async)]
+fn add_replica(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+) -> Result<Option<Vec<String>>, String> {
+    let default_name = {
+        let guard = state.open.lock().unwrap();
+        let ov = guard.as_ref().ok_or("nenhum container aberto")?;
+        let base = Path::new(&ov.path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "cofre".into());
+        format!("{base}-replica.vault")
+    };
+    let chosen = app
+        .dialog()
+        .file()
+        .set_file_name(&default_name)
+        .add_filter("Cofre fsmanager", &["vault"])
+        .blocking_save_file();
+    let dest = match chosen {
+        Some(p) => p.to_string(),
+        None => return Ok(None),
+    };
+    let list = with_vault(&state, |v| {
+        let mut r = v.replicas().to_vec();
+        if !r.contains(&dest) {
+            r.push(dest.clone());
+        }
+        v.set_replicas(r);
+        v.commit().map_err(s)?;
+        Ok(v.replicas().to_vec())
+    })?;
+    Ok(Some(list))
+}
+
+/// Remove uma réplica pelo caminho.
+#[tauri::command]
+fn remove_replica(state: State<AppState>, path: String) -> Result<Vec<String>, String> {
+    with_vault(&state, |v| {
+        let r: Vec<String> = v.replicas().iter().filter(|p| **p != path).cloned().collect();
+        v.set_replicas(r);
+        v.commit().map_err(s)?;
+        Ok(v.replicas().to_vec())
+    })
+}
+
+#[derive(Serialize)]
+struct ReplicaSyncDto {
+    path: String,
+    ok: bool,
+    full: bool,
+    bytes_copied: u64,
+    error: Option<String>,
+}
+
+/// Sincroniza TODAS as réplicas (backup incremental para cada). Best-effort.
+#[tauri::command(async)]
+fn sync_replicas(state: State<AppState>) -> Result<Vec<ReplicaSyncDto>, String> {
+    let guard = state.open.lock().unwrap();
+    let ov = guard.as_ref().ok_or("nenhum container aberto")?;
+    let replicas = ov.vault.replicas().to_vec();
+    let mut out = Vec::new();
+    for p in replicas {
+        match ov.vault.backup_to(&p, false) {
+            Ok(r) => out.push(ReplicaSyncDto {
+                path: p,
+                ok: true,
+                full: r.full,
+                bytes_copied: r.bytes_copied,
+                error: None,
+            }),
+            Err(e) => out.push(ReplicaSyncDto {
+                path: p,
+                ok: false,
+                full: false,
+                bytes_copied: 0,
+                error: Some(e.to_string()),
+            }),
+        }
+    }
+    Ok(out)
+}
+
 /// Localiza o binário `fsm-mount` (env `FSM_MOUNT_BIN`, ao lado do exe, ou alvos de dev).
 fn resolve_mount_bin() -> Result<std::path::PathBuf, String> {
     let name = if cfg!(windows) {
@@ -1182,6 +1355,12 @@ pub fn run() {
             change_password,
             verify_vault,
             repair_vault,
+            backup_vault,
+            transfer_to,
+            get_replicas,
+            add_replica,
+            remove_replica,
+            sync_replicas,
             mount_drive,
             unmount_drive,
             mount_status,

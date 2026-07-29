@@ -86,6 +86,8 @@ fsm bench --size 200               # mede throughput do motor (--encrypted opcio
 fsm transfer origem.vault destino.vault      # copia arquivos entre cofres
 fsm transfer a.vault b.vault --path /docs --src-password X --dst-password Y
 fsm backup meu.vault meu.bak       # backup incremental (só o delta); --full força completo
+fsm mirror meu.vault rep1.vault rep2.vault   # espelha em N réplicas
+fsm mirror meu.vault rep.vault --interval 30 # contínuo: re-sincroniza a cada 30s
 ```
 
 ## Montar como drive (CLI)

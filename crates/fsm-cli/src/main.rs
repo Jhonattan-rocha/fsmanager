@@ -163,6 +163,22 @@ enum Cmd {
         #[arg(long, short = 'p')]
         password: Option<String>,
     },
+    /// Espelha o cofre em uma ou mais RÉPLICAS (backup incremental para cada).
+    /// Com --interval, roda em loop e re-sincroniza quando o cofre muda.
+    Mirror {
+        vault: PathBuf,
+        /// Um ou mais arquivos-réplica de destino.
+        #[arg(required = true, num_args = 1..)]
+        dest: Vec<PathBuf>,
+        /// Modo CONTÍNUO: re-sincroniza a cada N segundos (Ctrl+C para parar).
+        #[arg(long)]
+        interval: Option<u64>,
+        /// Força backup COMPLETO a cada ciclo.
+        #[arg(long)]
+        full: bool,
+        #[arg(long, short = 'p')]
+        password: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -537,6 +553,68 @@ fn main() -> Result<()> {
             println!("backup: {} -> {}", vault.display(), dest.display());
             println!("  tipo:    {}", if r.full { "COMPLETO" } else { "incremental" });
             println!("  copiado: {:.1} MB de {:.1} MB total", mb(r.bytes_copied), mb(r.total));
+        }
+        Cmd::Mirror {
+            vault,
+            dest,
+            interval,
+            full,
+            password,
+        } => {
+            let pw = resolve_pw(password);
+            let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+            // Sincroniza o cofre para TODOS os destinos (best-effort). Retorna nº de sucessos.
+            let sync_once = |v: &Vault| -> usize {
+                let mut ok = 0;
+                for d in &dest {
+                    match v.backup_to(d, full) {
+                        Ok(r) => {
+                            ok += 1;
+                            println!(
+                                "  ok {} ({}, {:.1} MB)",
+                                d.display(),
+                                if r.full { "full" } else { "incr" },
+                                mb(r.bytes_copied)
+                            );
+                        }
+                        Err(e) => eprintln!("  ERRO {}: {e}", d.display()),
+                    }
+                }
+                ok
+            };
+
+            match interval {
+                None => {
+                    let v = Vault::open(&vault, pw.as_deref())?;
+                    if sync_once(&v) < dest.len() {
+                        std::process::exit(1);
+                    }
+                }
+                Some(secs) => {
+                    println!(
+                        "espelhando {} a cada {secs}s em {} réplica(s) — Ctrl+C para parar",
+                        vault.display(),
+                        dest.len()
+                    );
+                    let mut last: Option<(u64, u64)> = None;
+                    loop {
+                        match Vault::open(&vault, pw.as_deref()) {
+                            Ok(v) => {
+                                // (epoch, tamanho) detecta commit (tamanho) e gc/rekey (epoch).
+                                let sig = (v.epoch(), v.used_bytes());
+                                if full || Some(sig) != last {
+                                    println!("[sync] replicando…");
+                                    sync_once(&v);
+                                    last = Some(sig);
+                                }
+                            }
+                            // Cofre em uso por outro processo (app/mount): tenta no próximo ciclo.
+                            Err(_) => {}
+                        }
+                        std::thread::sleep(Duration::from_secs(secs.max(1)));
+                    }
+                }
+            }
         }
     }
     Ok(())

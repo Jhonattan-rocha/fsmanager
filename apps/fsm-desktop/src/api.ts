@@ -59,6 +59,21 @@ export interface RepairResult {
   removed: string[];
 }
 
+export interface BackupResult {
+  full: boolean;
+  bytes_copied: number;
+  total: number;
+  dest: string;
+}
+
+export interface ReplicaSync {
+  path: string;
+  ok: boolean;
+  full: boolean;
+  bytes_copied: number;
+  error: string | null;
+}
+
 export interface AddProgress {
   file: string;
   done: number;
@@ -100,6 +115,13 @@ export const api = {
   changePassword: (newPassword: string | null) => invoke<void>("change_password", { newPassword }),
   verifyVault: () => invoke<VerifyResult>("verify_vault"),
   repairVault: () => invoke<RepairResult>("repair_vault"),
+  backupVault: (full: boolean) => invoke<BackupResult | null>("backup_vault", { full }),
+  transferTo: (prefix: string, dstPassword: string | null) =>
+    invoke<number | null>("transfer_to", { prefix, dstPassword }),
+  getReplicas: () => invoke<string[]>("get_replicas"),
+  addReplica: () => invoke<string[] | null>("add_replica"),
+  removeReplica: (path: string) => invoke<string[]>("remove_replica", { path }),
+  syncReplicas: () => invoke<ReplicaSync[]>("sync_replicas"),
 
   mountDrive: (mountpoint: string) => invoke<string>("mount_drive", { mountpoint }),
   unmountDrive: () => invoke<void>("unmount_drive"),

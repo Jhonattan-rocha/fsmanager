@@ -112,6 +112,26 @@ v8 (bincode legado) são lidos e MIGRADOS para v9 no primeiro commit.
       remover campo não força bump nem recria vault. VALIDADO: teste de migração
       real v8→v9 (fabrica header+bincode, abre, migra, confirma v9 no disco) e
       teste de tolerância (campo ausente vira default; campo extra é ignorado).
+- [x] TRANSFER + RÉPLICAS NA UI (⚙️ Gerenciar): seção "📤 Transferir" (copia os
+      arquivos p/ outro cofre escolhido no diálogo, cria/mescla, re-cifra) e "🔁
+      Réplicas" (lista persistida NO CATÁLOGO — campo `replicas` novo, tolerante v9,
+      sem quebrar cofres antigos — com add/remover/sincronizar-todas via `backup_to`
+      incremental best-effort). Comandos `transfer_to`/`get_replicas`/`add_replica`/
+      `remove_replica`/`sync_replicas`. Tudo com o cofre ABERTO (o app lê pelo próprio
+      handle). `compact`/`rekey` preservam a lista de réplicas.
+- [x] BACKUP NA UI (com o cofre ABERTO): seção "💾 Backup" no ⚙️ Gerenciar +
+      comando `backup_vault` (escolhe destino via diálogo, chama `vault.backup_to`).
+      Diferencial: o app lê pelo PRÓPRIO handle do vault, então faz backup SEM
+      fechar/destravar o cofre — a CLI não consegue (precisaria do lock). Incremental
+      ao repetir no mesmo arquivo; "Completo" força full. Restaurar = abrir a cópia.
+- [x] RÉPLICA-ESPELHO (HA pragmático): `fsm mirror <vault> <rep1> [rep2...]`
+      espelha o cofre em N réplicas (backup incremental p/ cada, best-effort). Modo
+      CONTÍNUO `--interval N`: loop que abre o cofre, detecta mudança por (epoch,
+      tamanho) e re-sincroniza — cede o lock entre ciclos, então o app segue usando.
+      Failover = abrir a réplica (é um cofre válido). NÃO é HA multi-nó com consenso/
+      failover automático (isso seria um pivô); é replicação contínua + troca manual.
+      VALIDADO: 2 réplicas com hash conferido, re-espelho incremental, e contínuo
+      pegando um arquivo novo automaticamente.
 - [x] BACKUP (full + INCREMENTAL): aproveita o append-only — como um commit só
       ANEXA ao fim + reescreve o header (nunca mexe no meio), o backup incremental
       copia só o header (4 KiB) + a CAUDA nova desde o último backup; o resultado é
