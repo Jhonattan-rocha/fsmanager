@@ -136,6 +136,33 @@ enum Cmd {
         #[arg(long)]
         encrypted: bool,
     },
+    /// Copia arquivos de um cofre para outro (cria o destino se não existir).
+    Transfer {
+        /// Cofre de ORIGEM
+        src: PathBuf,
+        /// Cofre de DESTINO (criado se não existir)
+        dst: PathBuf,
+        /// Copia só a subárvore sob este caminho (padrão: tudo).
+        #[arg(long, default_value = "/")]
+        path: String,
+        /// Senha do cofre de ORIGEM.
+        #[arg(long)]
+        src_password: Option<String>,
+        /// Senha do cofre de DESTINO (também usada ao CRIAR um destino cifrado).
+        #[arg(long)]
+        dst_password: Option<String>,
+    },
+    /// Faz backup do cofre para um arquivo (incremental por padrão; --full força completo).
+    Backup {
+        vault: PathBuf,
+        /// Arquivo de destino do backup (um .vault idêntico e abrível).
+        dest: PathBuf,
+        /// Força um backup COMPLETO (ignora o incremental).
+        #[arg(long)]
+        full: bool,
+        #[arg(long, short = 'p')]
+        password: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -473,6 +500,43 @@ fn main() -> Result<()> {
             println!("economia dedup:   {:.1}%", s.dedup_savings() * 100.0);
             println!("economia compr.:  {:.1}%", s.compression_savings() * 100.0);
             println!("economia total:   {:.1}%", s.total_savings() * 100.0);
+        }
+        Cmd::Transfer {
+            src,
+            dst,
+            path,
+            src_password,
+            dst_password,
+        } => {
+            let src_v = Vault::open(&src, src_password.as_deref())?;
+            let mut dst_v = if dst.exists() {
+                Vault::open(&dst, dst_password.as_deref())?
+            } else if let Some(pw) = &dst_password {
+                Vault::create_encrypted(&dst, DEFAULT_AVG_CHUNK, pw)?
+            } else {
+                Vault::create(&dst, DEFAULT_AVG_CHUNK)?
+            };
+            let n = dst_v.transfer_from(&src_v, &path)?;
+            dst_v.commit()?;
+            println!(
+                "transferidos {n} arquivo(s) de {} para {}",
+                src.display(),
+                dst.display()
+            );
+        }
+        Cmd::Backup {
+            vault,
+            dest,
+            full,
+            password,
+        } => {
+            let pw = resolve_pw(password);
+            let v = Vault::open(&vault, pw.as_deref())?;
+            let r = v.backup_to(&dest, full)?;
+            let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+            println!("backup: {} -> {}", vault.display(), dest.display());
+            println!("  tipo:    {}", if r.full { "COMPLETO" } else { "incremental" });
+            println!("  copiado: {:.1} MB de {:.1} MB total", mb(r.bytes_copied), mb(r.total));
         }
     }
     Ok(())

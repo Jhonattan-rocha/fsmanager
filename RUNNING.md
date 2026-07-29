@@ -83,6 +83,9 @@ fsm verify meu.vault               # checa integridade (exit≠0 se corrompido)
 fsm repair meu.vault               # repara: trunca/remove arquivos danificados
 fsm quota meu.vault 2048           # limita o cofre a 2 GB (ou --clear p/ remover)
 fsm bench --size 200               # mede throughput do motor (--encrypted opcional)
+fsm transfer origem.vault destino.vault      # copia arquivos entre cofres
+fsm transfer a.vault b.vault --path /docs --src-password X --dst-password Y
+fsm backup meu.vault meu.bak       # backup incremental (só o delta); --full força completo
 ```
 
 ## Montar como drive (CLI)

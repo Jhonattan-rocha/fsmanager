@@ -112,6 +112,30 @@ v8 (bincode legado) são lidos e MIGRADOS para v9 no primeiro commit.
       remover campo não força bump nem recria vault. VALIDADO: teste de migração
       real v8→v9 (fabrica header+bincode, abre, migra, confirma v9 no disco) e
       teste de tolerância (campo ausente vira default; campo extra é ignorado).
+- [x] BACKUP (full + INCREMENTAL): aproveita o append-only — como um commit só
+      ANEXA ao fim + reescreve o header (nunca mexe no meio), o backup incremental
+      copia só o header (4 KiB) + a CAUDA nova desde o último backup; o resultado é
+      byte-idêntico e abrível (restore = usar o arquivo). Segurança de linhagem via
+      EPOCH no header (u64 no offset 256, 1º setor/atômico): estável em commits,
+      RENOVADO em gc/rekey → força full quando o arquivo foi reescrito. `Vault::
+      backup_to(dest, force_full)`, CLI `fsm backup <vault> <dest> [--full] [-p]`.
+      Abre o cofre (lock) p/ consistência. VALIDADO: base 30 MB + delta 1 MB →
+      incremental copia 1,1 MB; gc → full; hash confere. Base p/ a réplica-espelho.
+- [x] TRANSFERIR ENTRE VAULTS: `Vault::transfer_from(src, prefix)` copia arquivos
+      de OUTRO cofre por streaming — decodifica no src e re-chunka/deduplica no
+      destino (chaves independentes, preserva caminhos e pastas vazias). CLI `fsm
+      transfer <src> <dst> [--path P] [--src-password] [--dst-password]` (cria o
+      destino, cifrado se der senha). VALIDADO: cifrado→sem cifra e →cifrado com
+      senha nova, filtro de subárvore, hash confere. Primitiva base p/ backup/réplica.
+- [x] THROUGHPUT DO DRIVE — DIAGNÓSTICO + READ-AHEAD: com profiling opt-in
+      (`FSM_MOUNT_PROFILE`) no callback de read, descobriu-se que o "teto de ~29
+      MB/s" era ARTEFATO de medir com `Get-FileHash` (lê em blocos de 4 KB → 51 mil
+      round-trips de IPC; 79% do tempo fora do nosso código). Uma cópia sequencial
+      real (`Copy-Item`, leituras de 1 MB) já faz ~220 MB/s com só ~200 callbacks.
+      Adicionado READ-AHEAD por handle (`ReadAhead`, janela de 1 MB): lê a janela do
+      cofre uma vez e serve as leituras miúdas seguintes dela. Pior caso 28→35 MB/s;
+      caso comum (cópia) 231 MB/s sem regressão; hashes conferidos. O resto (~5s de
+      IPC no pior caso) é do WinFsp, irredutível do nosso lado.
 - [x] `fsm bench` + `fsm quota` (CLI): `bench` mede o throughput do MOTOR (cofre
       temporário, payload incompressível, escrita/dedup/leitura, cifrado ou não).
       Números de referência (200 MB, release): escrita 50 MB/s (37 cifrado), leitura

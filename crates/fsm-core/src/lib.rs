@@ -47,6 +47,11 @@ use serde::{Deserialize, Serialize};
 pub const MAGIC: &[u8; 8] = b"FSMVLT01";
 /// Tamanho fixo do header em bytes.
 pub const HEADER_SIZE: u64 = 4096;
+/// Offset do EPOCH no header: ID de linhagem (u64) gerado no `create` e
+/// PRESERVADO em commits normais (append-only), mas RENOVADO em `compact`/`rekey`
+/// (que reescrevem o arquivo). Fica no 1º setor (< 512) → escrita atômica.
+/// Região antes zerada, então cofres antigos leem 0 (backup faz full nesse caso).
+const EPOCH_OFFSET: usize = 256;
 /// Tamanho médio de chunk alvo do FastCDC (64 KiB). Min/max são derivados dele.
 /// Fronteiras definidas pelo conteúdo: editar o meio de um arquivo não desloca
 /// os blocos seguintes, então o dedup sobrevive a inserções/edições.
@@ -199,6 +204,9 @@ pub struct Vault {
     zstd_level: i32,
     /// Estado de criptografia, se o container tiver senha.
     enc: Option<EncState>,
+    /// ID de linhagem (backup): estável em commits, renovado em compact/rekey.
+    /// 0 = cofre antigo sem epoch (backup faz sempre full).
+    epoch: u64,
     /// Cache de blocos já decodificados (descomprimidos/decifrados), por hash.
     /// Blocos são imutáveis (content-addressed), então nunca ficam obsoletos.
     /// `Mutex` para permitir leitura compartilhada (`&self`) e paralela.
@@ -327,6 +335,7 @@ impl Vault {
             next_append: HEADER_SIZE,
             zstd_level: DEFAULT_ZSTD_LEVEL,
             enc,
+            epoch: random_u64(),
             cache: Mutex::new(BlockCache::new(DEFAULT_CACHE_CAP)),
         };
         vault.file.set_len(HEADER_SIZE)?;
@@ -397,6 +406,7 @@ impl Vault {
             None => buf,
         };
         let catalog: Catalog = decode_catalog(version, &raw)?;
+        let epoch = u64::from_le_bytes(header[EPOCH_OFFSET..EPOCH_OFFSET + 8].try_into().unwrap());
 
         Ok(Vault {
             file,
@@ -406,6 +416,7 @@ impl Vault {
             next_append: catalog_offset + catalog_len,
             zstd_level: DEFAULT_ZSTD_LEVEL,
             enc,
+            epoch,
             cache: Mutex::new(BlockCache::new(DEFAULT_CACHE_CAP)),
         })
     }
@@ -648,6 +659,99 @@ impl Vault {
             },
         );
         Ok(())
+    }
+
+    /// Copia arquivos de OUTRO cofre (`src`) para este, por streaming — decodifica
+    /// no `src` e re-chunka/deduplica aqui (containers têm chaves independentes).
+    /// `prefix` filtra a subárvore de origem ("/" = tudo); os caminhos lógicos são
+    /// preservados. Sobrescreve arquivos de mesmo nome no destino. Chame `commit`.
+    /// Retorna quantos arquivos foram copiados.
+    pub fn transfer_from(&mut self, src: &Vault, prefix: &str) -> Result<usize> {
+        let pre = normalize_path(prefix);
+        let under = |p: &str| pre == "/" || p == pre || p.starts_with(&format!("{pre}/"));
+        let paths: Vec<(String, u64, i64)> = src
+            .catalog
+            .files
+            .iter()
+            .filter(|(p, _)| under(p))
+            .map(|(p, e)| (p.clone(), e.size, e.mtime))
+            .collect();
+
+        const WINDOW: usize = 4 * 1024 * 1024;
+        for (path, size, mtime) in &paths {
+            let mut w = self.stream_writer();
+            let mut offset = 0u64;
+            while offset < *size {
+                let data = src.read_range(path, offset, WINDOW)?;
+                if data.is_empty() {
+                    break;
+                }
+                self.stream_write(&mut w, offset, &data)?;
+                offset += data.len() as u64;
+            }
+            self.finish_write(w, path, *mtime)?;
+        }
+        // Preserva diretórios explícitos (vazios) sob o prefixo.
+        for d in src.catalog.dirs.iter().filter(|d| under(d)) {
+            self.catalog.dirs.insert(d.clone());
+        }
+        Ok(paths.len())
+    }
+
+    /// ID de linhagem do cofre (para lógica de backup incremental).
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Faz backup do cofre para `dest` (um arquivo `.vault` idêntico e abrível).
+    /// INCREMENTAL quando possível: como commits só ANEXAM (append-only), copia
+    /// apenas o header (4 KiB) + a cauda nova desde o último backup — desde que a
+    /// LINHAGEM (epoch) bata. Um `gc`/`rekey` renova o epoch e força um backup full.
+    /// `force_full` ignora o incremental. Chame com o cofre já aberto (consistente).
+    pub fn backup_to(&self, dest: impl AsRef<Path>, force_full: bool) -> Result<BackupReport> {
+        let dest = dest.as_ref();
+        let total = self.next_append; // fim lógico (append-only) = tamanho do cofre
+
+        // Incremental exige: mesma linhagem (epoch != 0 e igual) e backup <= cofre.
+        let base_len = if force_full || self.epoch == 0 || !dest.exists() {
+            None
+        } else {
+            match read_backup_meta(dest) {
+                Ok((bepoch, blen)) if bepoch == self.epoch && blen <= total => Some(blen),
+                _ => None,
+            }
+        };
+
+        if let Some(blen) = base_len {
+            // Header (mudou) + cauda nova. O meio [4096, blen) é imutável no cofre.
+            let mut bf = OpenOptions::new().write(true).open(dest)?;
+            let mut header = vec![0u8; HEADER_SIZE as usize];
+            read_exact_at(&self.file, &mut header, 0)?;
+            bf.seek(SeekFrom::Start(0))?;
+            bf.write_all(&header)?;
+            if total > blen {
+                bf.seek(SeekFrom::Start(blen))?;
+                copy_range(&self.file, &mut bf, blen, total)?;
+            }
+            bf.set_len(total)?;
+            bf.sync_all()?;
+            Ok(BackupReport {
+                full: false,
+                bytes_copied: HEADER_SIZE + total.saturating_sub(blen),
+                total,
+            })
+        } else {
+            // Full: reescreve o destino do zero.
+            let mut bf = File::create(dest)?;
+            copy_range(&self.file, &mut bf, 0, total)?;
+            bf.set_len(total)?;
+            bf.sync_all()?;
+            Ok(BackupReport {
+                full: true,
+                bytes_copied: total,
+                total,
+            })
+        }
     }
 
     /// Cria um diretório explícito (vazio). Diretórios derivados de arquivos
@@ -1332,7 +1436,8 @@ impl Vault {
         newfile.write_all(&bytes)?;
         newfile.sync_data()?;
 
-        let header = build_header(self.chunk_size, next, bytes.len() as u64, self.enc.as_ref());
+        // compact: arquivo NOVO => nova linhagem (epoch), invalida incremental antigo.
+        let header = build_header(self.chunk_size, next, bytes.len() as u64, self.enc.as_ref(), random_u64());
         newfile.seek(SeekFrom::Start(0))?;
         newfile.write_all(&header)?;
         newfile.sync_all()?;
@@ -1428,7 +1533,8 @@ impl Vault {
         newfile.write_all(&bytes)?;
         newfile.sync_data()?;
 
-        let header = build_header(self.chunk_size, next, bytes.len() as u64, new_enc.as_ref());
+        // rekey: arquivo NOVO => nova linhagem (epoch).
+        let header = build_header(self.chunk_size, next, bytes.len() as u64, new_enc.as_ref(), random_u64());
         newfile.seek(SeekFrom::Start(0))?;
         newfile.write_all(&header)?;
         newfile.sync_all()?;
@@ -1450,7 +1556,7 @@ impl Vault {
         self.file.write_all(&bytes)?;
         self.file.sync_data()?;
 
-        let header = build_header(self.chunk_size, offset, bytes.len() as u64, self.enc.as_ref());
+        let header = build_header(self.chunk_size, offset, bytes.len() as u64, self.enc.as_ref(), self.epoch);
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(&header)?;
         self.file.sync_all()?;
@@ -1548,6 +1654,16 @@ pub struct RepairReport {
     pub truncated: Vec<(String, u64)>,
 }
 
+/// Resultado de um backup ([`Vault::backup_to`]).
+pub struct BackupReport {
+    /// `true` se foi um backup COMPLETO; `false` se INCREMENTAL.
+    pub full: bool,
+    /// Bytes efetivamente copiados para o destino.
+    pub bytes_copied: u64,
+    /// Tamanho total do cofre (= tamanho final do backup).
+    pub total: u64,
+}
+
 /// Resultado de uma compactação ([`Vault::compact_to`]).
 pub struct CompactReport {
     pub blocks_before: usize,
@@ -1581,12 +1697,48 @@ fn decode_catalog(version: u32, raw: &[u8]) -> Result<Catalog> {
     }
 }
 
+/// u64 aleatório (para o epoch de linhagem).
+fn random_u64() -> u64 {
+    let b: [u8; 8] = random_bytes();
+    u64::from_le_bytes(b)
+}
+
+/// Lê (epoch, tamanho) de um arquivo de backup existente, para decidir
+/// incremental vs full. Falha se não for um container válido.
+fn read_backup_meta(path: &Path) -> Result<(u64, u64)> {
+    let mut f = File::open(path)?;
+    let mut header = [0u8; HEADER_SIZE as usize];
+    f.read_exact(&mut header)
+        .context("backup existente curto/corrompido")?;
+    if &header[0..8] != MAGIC {
+        bail!("o destino existe mas não é um container fsmanager");
+    }
+    let epoch = u64::from_le_bytes(header[EPOCH_OFFSET..EPOCH_OFFSET + 8].try_into().unwrap());
+    let len = f.metadata()?.len();
+    Ok((epoch, len))
+}
+
+/// Copia `[from, to)` do arquivo `src` (leitura posicionada) escrevendo
+/// sequencialmente no cursor atual de `dst`.
+fn copy_range(src: &File, dst: &mut File, from: u64, to: u64) -> Result<()> {
+    let mut off = from;
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+    while off < to {
+        let n = ((to - off) as usize).min(buf.len());
+        read_exact_at(src, &mut buf[..n], off)?;
+        dst.write_all(&buf[..n])?;
+        off += n as u64;
+    }
+    Ok(())
+}
+
 /// Monta o header de 4 KiB com os ponteiros e o estado de criptografia.
 fn build_header(
     chunk_size: u32,
     catalog_offset: u64,
     catalog_len: u64,
     enc: Option<&EncState>,
+    epoch: u64,
 ) -> [u8; HEADER_SIZE as usize] {
     let mut header = [0u8; HEADER_SIZE as usize];
     header[0..8].copy_from_slice(MAGIC);
@@ -1594,6 +1746,7 @@ fn build_header(
     header[12..16].copy_from_slice(&chunk_size.to_le_bytes());
     header[16..24].copy_from_slice(&catalog_offset.to_le_bytes());
     header[24..32].copy_from_slice(&catalog_len.to_le_bytes());
+    header[EPOCH_OFFSET..EPOCH_OFFSET + 8].copy_from_slice(&epoch.to_le_bytes());
     if let Some(e) = enc {
         header[32..36].copy_from_slice(&HFLAG_ENCRYPTED.to_le_bytes());
         header[36..36 + SALT_LEN].copy_from_slice(&e.salt);
@@ -1982,6 +2135,95 @@ mod tests {
         let bytes2 = rmp_serde::to_vec_named(&newer).unwrap();
         let cat2: Catalog = rmp_serde::from_slice(&bytes2).unwrap();
         assert_eq!(cat2.quota, Some(42));
+    }
+
+    #[test]
+    fn backup_full_then_incremental() {
+        let dir = tmp_dir("backup");
+        let vp = dir.join("v.vault");
+        let bp = dir.join("v.bak");
+        let _ = std::fs::remove_file(&vp);
+        let _ = std::fs::remove_file(&bp);
+
+        let mut v = Vault::create(&vp, DEFAULT_AVG_CHUNK).unwrap();
+        v.write_file("/a.txt", b"conteudo A", 1).unwrap();
+        v.commit().unwrap();
+
+        // 1) Full (destino não existe).
+        let r1 = v.backup_to(&bp, false).unwrap();
+        assert!(r1.full);
+        {
+            let b = Vault::open(&bp, None).unwrap();
+            assert!(b.resolve("/a.txt").is_some());
+        }
+
+        // 2) Adiciona dados → INCREMENTAL (mesma linhagem, copia menos que o total).
+        let big = pseudo_random(7, 500_000);
+        let f = dir.join("big.bin");
+        std::fs::write(&f, &big).unwrap();
+        v.add_file(&f, "big.bin").unwrap();
+        v.commit().unwrap();
+        let r2 = v.backup_to(&bp, false).unwrap();
+        assert!(!r2.full, "deveria ser incremental");
+        assert!(r2.bytes_copied < r2.total, "incremental copia menos que o total");
+        {
+            let b = Vault::open(&bp, None).unwrap();
+            let got = b.read_range("/big.bin", 0, big.len()).unwrap();
+            assert_eq!(got, big, "backup incremental deve refletir o novo estado");
+        }
+
+        // 3) gc renova o epoch → próximo backup é FULL.
+        let epoch_before = v.epoch();
+        drop(v);
+        let tmp = dir.join("v.compact");
+        {
+            let mut vc = Vault::open(&vp, None).unwrap();
+            vc.compact_to(&tmp).unwrap();
+        }
+        std::fs::rename(&tmp, &vp).unwrap();
+        let v3 = Vault::open(&vp, None).unwrap();
+        assert_ne!(v3.epoch(), epoch_before, "gc deve renovar o epoch");
+        let r3 = v3.backup_to(&bp, false).unwrap();
+        assert!(r3.full, "após gc (nova linhagem), o backup deve ser full");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transfer_between_vaults() {
+        let dir = tmp_dir("transfer");
+        let sp = dir.join("src.vault");
+        let dp = dir.join("dst.vault");
+        let _ = std::fs::remove_file(&sp);
+        let _ = std::fs::remove_file(&dp);
+
+        // src: CIFRADO, com arquivos em subpastas + uma pasta vazia.
+        let mut src = Vault::create_encrypted(&sp, DEFAULT_AVG_CHUNK, "src-pw").unwrap();
+        let a = pseudo_random(1, 300_000);
+        let f = dir.join("a.bin");
+        std::fs::write(&f, &a).unwrap();
+        src.add_file(&f, "docs/a.bin").unwrap();
+        src.write_file("/notas.txt", b"oi", 5).unwrap();
+        src.create_dir("/vazia").unwrap();
+        src.commit().unwrap();
+
+        // dst: SEM cifra (chaves independentes) — o conteúdo é re-cifrado/re-chunkado.
+        let mut dst = Vault::create(&dp, DEFAULT_AVG_CHUNK).unwrap();
+        let n = dst.transfer_from(&src, "/docs").unwrap();
+        dst.commit().unwrap();
+        assert_eq!(n, 1, "só /docs/a.bin sob o prefixo");
+        let got = dst.read_range("/docs/a.bin", 0, a.len()).unwrap();
+        assert_eq!(got, a, "conteúdo transferido deve bater");
+        assert!(dst.resolve("/notas.txt").is_none(), "fora do prefixo não copia");
+
+        // Transfer completo traz o resto + a pasta vazia explícita.
+        let n2 = dst.transfer_from(&src, "/").unwrap();
+        dst.commit().unwrap();
+        assert_eq!(n2, 2);
+        assert!(dst.resolve("/notas.txt").is_some());
+        assert!(dst.catalog().dirs.contains("/vazia"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

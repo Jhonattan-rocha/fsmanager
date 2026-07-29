@@ -6,8 +6,9 @@
 //! via [`Vault::write_file`], seguido de commit.
 
 use std::ffi::c_void;
-use std::sync::{Mutex, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, RwLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use fsm_core::{NodeKind, StreamWriter, Vault};
@@ -29,6 +30,16 @@ const ALLOC_UNIT: u64 = 4096;
 const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 /// Flag de `cleanup` que indica exclusão pendente.
 const FSP_CLEANUP_DELETE: u32 = 0x01;
+
+// --- profiling opt-in do caminho de leitura (env FSM_MOUNT_PROFILE) ---
+static PROF: OnceLock<bool> = OnceLock::new();
+static READ_CALLS: AtomicU64 = AtomicU64::new(0);
+static READ_BYTES: AtomicU64 = AtomicU64::new(0);
+static READ_NANOS: AtomicU64 = AtomicU64::new(0);
+static READ_MAXLEN: AtomicU64 = AtomicU64::new(0);
+fn prof_on() -> bool {
+    *PROF.get_or_init(|| std::env::var("FSM_MOUNT_PROFILE").is_ok())
+}
 
 /// Contexto do filesystem montado.
 struct FsmFs {
@@ -67,11 +78,24 @@ struct HState {
     dirty: bool,
 }
 
+/// Janela de read-ahead por handle: reduz o custo do nosso código quando o app
+/// lê em blocos minúsculos (ex.: 4 KB). Lemos uma janela grande do cofre uma vez
+/// e servimos as leituras sequenciais seguintes daqui (sem tocar no cofre).
+struct ReadAhead {
+    start: u64,
+    data: Vec<u8>,
+}
+/// Tamanho da janela de read-ahead (casa com o tamanho de leitura do Cache
+/// Manager em cópias sequenciais, que já rendem ~220 MB/s).
+const READAHEAD_WINDOW: usize = 1024 * 1024;
+
 /// Handle de um arquivo/diretório aberto.
 struct Handle {
     path: String,
     is_dir: bool,
     state: Mutex<HState>,
+    /// Cache de leitura sequencial (independente do estado de escrita).
+    readahead: Mutex<Option<ReadAhead>>,
     dir_buffer: DirBuffer,
 }
 
@@ -93,6 +117,7 @@ impl Handle {
             path,
             is_dir,
             state: Mutex::new(state),
+            readahead: Mutex::new(None),
             dir_buffer: DirBuffer::new(),
         }
     }
@@ -362,33 +387,63 @@ impl FileSystemContext for FsmFs {
         if context.is_dir {
             return Err(STATUS_INVALID_PARAMETER.into());
         }
-        let mut st = context.state.lock().unwrap();
-        // Leitura no meio de uma escrita streaming: materializa para servir.
-        if st.writer.is_some() {
-            self.ensure_buf(context, &mut st)?;
-        }
-        if let Some(buf) = &st.buf {
-            if offset as usize >= buf.len() {
-                return Err(STATUS_END_OF_FILE.into());
+        let prof = prof_on();
+        let t0 = if prof { Some(Instant::now()) } else { None };
+        let want = buffer.len();
+
+        let result: winfsp::Result<u32> = (|| {
+            let mut st = context.state.lock().unwrap();
+            // Leitura no meio de uma escrita streaming: materializa para servir.
+            if st.writer.is_some() {
+                self.ensure_buf(context, &mut st)?;
             }
-            let from = offset as usize;
-            let to = (from + buffer.len()).min(buf.len());
-            buffer[..to - from].copy_from_slice(&buf[from..to]);
-            Ok((to - from) as u32)
-        } else {
-            drop(st);
-            let data = self
-                .vault
-                .read()
-                .unwrap()
-                .read_range(&context.path, offset, buffer.len())
-                .map_err(io_fsp)?;
-            if data.is_empty() {
-                return Err(STATUS_END_OF_FILE.into());
+            if let Some(buf) = &st.buf {
+                if offset as usize >= buf.len() {
+                    return Err(STATUS_END_OF_FILE.into());
+                }
+                let from = offset as usize;
+                let to = (from + buffer.len()).min(buf.len());
+                buffer[..to - from].copy_from_slice(&buf[from..to]);
+                Ok((to - from) as u32)
+            } else {
+                drop(st);
+                let mut ra = context.readahead.lock().unwrap();
+                // HIT: a janela cobre todo o pedido → serve sem tocar no cofre.
+                if let Some(w) = ra.as_ref() {
+                    let end = offset + want as u64;
+                    if offset >= w.start && end <= w.start + w.data.len() as u64 {
+                        let rel = (offset - w.start) as usize;
+                        buffer[..want].copy_from_slice(&w.data[rel..rel + want]);
+                        return Ok(want as u32);
+                    }
+                }
+                // MISS: lê uma JANELA a partir de offset, serve o pedido e cacheia.
+                let win = want.max(READAHEAD_WINDOW);
+                let data = self
+                    .vault
+                    .read()
+                    .unwrap()
+                    .read_range(&context.path, offset, win)
+                    .map_err(io_fsp)?;
+                if data.is_empty() {
+                    return Err(STATUS_END_OF_FILE.into());
+                }
+                let n = want.min(data.len());
+                buffer[..n].copy_from_slice(&data[..n]);
+                *ra = Some(ReadAhead { start: offset, data });
+                Ok(n as u32)
             }
-            buffer[..data.len()].copy_from_slice(&data);
-            Ok(data.len() as u32)
+        })();
+
+        if let Some(t0) = t0 {
+            READ_CALLS.fetch_add(1, Ordering::Relaxed);
+            READ_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            READ_MAXLEN.fetch_max(want as u64, Ordering::Relaxed);
+            if let Ok(n) = &result {
+                READ_BYTES.fetch_add(*n as u64, Ordering::Relaxed);
+            }
         }
+        result
     }
 
     fn write(
@@ -723,6 +778,19 @@ pub fn mount(vault_path: &str, mountpoint: &str, password: Option<&str>) -> Resu
     let _ = rx.recv();
 
     println!("desmontando…");
+    if prof_on() {
+        let calls = READ_CALLS.load(Ordering::Relaxed);
+        let bytes = READ_BYTES.load(Ordering::Relaxed);
+        let secs = READ_NANOS.load(Ordering::Relaxed) as f64 / 1e9;
+        let mb = bytes as f64 / (1024.0 * 1024.0);
+        let avg_kb = if calls > 0 { bytes as f64 / calls as f64 / 1024.0 } else { 0.0 };
+        eprintln!(
+            "[profile] reads: {calls} callbacks · {mb:.1} MB · {secs:.2}s dentro do read \
+             ({:.0} MB/s no callback) · tam. médio {avg_kb:.0} KB · máx {} KB",
+            if secs > 0.0 { mb / secs } else { 0.0 },
+            READ_MAXLEN.load(Ordering::Relaxed) / 1024
+        );
+    }
     drop(host);
     Ok(())
 }
